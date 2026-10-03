@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name            115影片墙
 // @namespace       cloud115.moviewall
-// @version         3.13.2
-// @description     115 网盘影片墙（Emby 式）：直接读视频同目录下的海报/NFO（由本机 115 Media Hub 的「导出媒体文件」生成）；**素材实时存到本地**——NFO 原文/解析结果/海报原图自动落盘，缓存位置可选「浏览器本地」或「你自选的本机文件夹」（写成磁盘真实文件，可备份可复用），重开零请求秒出；卡片显示文件大小与码率；**新增「详情」面板**——剧情简介/标签/原名/厂牌/发行/系列/导演/时长/分级/国家/评分/数据来源 + 文件信息一屏看全（对齐 hub 的详情抽屉），卡片一行放不下的都在这里；排序支持 番号/文件名/目录/演员/类型/评分/观看日期/随机；勾选卡片可批量移动/删除并连带海报与 NFO，**做完原地摘卡片——不刷新页面、图不重下、滚动不跳**；**横版卡片默认用「横版高清」（-thumb/-fanart 里挑体积最大的那张：实测中位 776KB，是竖海报的 2.9 倍），可在设置里改成竖版海报或剧照；海报只有 147×200 时（约占 24%）会自动跳过糊图改用清晰图**
+// @version         3.15.0
+// @description     115 网盘影片墙（Emby 式）：直接读视频同目录下的海报/NFO（由本机 115 Media Hub 的「导出媒体文件」生成）；**素材实时存到本地**——NFO 原文/解析结果/海报原图自动落盘，缓存位置可选「浏览器本地」或「你自选的本机文件夹」（写成磁盘真实文件，可备份可复用），重开零请求秒出；卡片显示文件大小与码率；**新增「详情」面板**——剧情简介/标签/原名/厂牌/发行/系列/导演/时长/分级/国家/评分/数据来源 + 文件信息一屏看全（对齐 hub 的详情抽屉），卡片一行放不下的都在这里；排序支持 番号/文件名/目录/演员/类型/评分/观看日期/随机；**视图可切「海报墙 ⇄ 紧凑列表」**（列表一行一部，左侧小缩略图 + 右侧番号/标题/目录，扫番号更快，选择会记住）；勾选卡片可批量移动/删除并连带海报与 NFO，**做完原地摘卡片——不刷新页面、图不重下、滚动不跳**；**横版卡片默认用「横版高清」（-thumb/-fanart 里挑体积最大的那张：实测中位 776KB，是竖海报的 2.9 倍），可在设置里改成竖版海报或剧照；海报只有 147×200 时（约占 24%）会自动跳过糊图改用清晰图**
 // @author          cloud115.moviewall
 // @license         MIT
 // @icon            https://115.com/favicon.ico
@@ -111,6 +111,7 @@
         columns: 0,                  // 卡片列数，0 = 自适应
         pageWidth: 100,              // 内容宽度 %
         masonry: false,              // 瀑布流
+        listView: 'wall',            // 视图：wall（海报墙）| list（紧凑列表，一行一片，适合快速扫番号）
         showPath: true,              // 显示所在目录
         showFileName: true,          // 显示原始文件名
         showSize: true,              // 显示文件大小
@@ -327,26 +328,71 @@
             return true;
         } catch (e) { return false; }
     }
-    /** 插进 innerHTML 前先转义（文件夹名之类的可能是任意字符） */
-    function escHtml(s) {
-        return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => (
-            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-        ));
-    }
-    function fmtBytes(n) {
-        if (!n) return '0 B';
-        if (n < 1024) return n + ' B';
-        if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
-        return (n / 1048576).toFixed(2) + ' MB';
-    }
-    /** 视频文件大小：动辄几个 GB，用 MB 读起来费劲，所以 1GB 起改用 GB */
-    function fmtVideoSize(n) {
-        const v = Number(n) || 0;
-        if (!v) return '';
-        if (v >= 1073741824) return (v / 1073741824).toFixed(2) + ' GB';
-        if (v >= 1048576) return Math.round(v / 1048576) + ' MB';
-        return fmtBytes(v);
-    }
+    /* ==== MW115_CORE:BEGIN ==== */
+    /* =============================================================================
+     * 115 系列油猴脚本 —— 公共核心
+     * -----------------------------------------------------------------------------
+     * ⚠️ 这是**源码**，不要直接拖进 Tampermonkey 安装。
+     *    正式交付的 scripts/*.user.js 由 `node tools/build.js` 把本文件内联进去生成。
+     *
+     * 只放「纯函数」：不吃 GM_*、不碰 DOM、不联网 —— 这样
+     *   ① 三个脚本不会因为各自手写一份而悄悄走偏（之前最常出问题就在这种地方）
+     *   ② 能用 `node --test tests/` 在 Node 里直接跑用例
+     *   ③ 内联后就是同一闭包里的几个普通变量，零运行时开销
+     *
+     * 内联形态（build.js 生成）：本文件原样贴进去得到 `var MW115Core`，
+     * 随后紧跟一行把导出名字绑到本地变量 —— 脚本里的调用点一个字都不用改。
+     * 注意：别把它改成 UMD 那套（挂到 root.XxxCore 上），那样闭包里拿不到名字，
+     * 编译检查也照样通过，只有真正跑到页面上才发现 ReferenceError。
+     * ========================================================================== */
+    var MW115Core = (function () {
+        'use strict';
+
+        /** HTML 转义。
+            两个脚本原来各写一份：整理助手那份**漏了单引号**，拼进 `title="${...}"` 时
+            遇到带撇号的片名就能把属性提前闭合。统一按最严的一份来。 */
+        var ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+        function escHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ESC_MAP[c]; });
+        }
+
+        /** 字节数 → 人类可读。 */
+        function fmtBytes(n) {
+            if (!n) return '0 B';
+            if (n < 1024) return n + ' B';
+            if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+            return (n / 1048576).toFixed(2) + ' MB';
+        }
+
+        /** 视频文件大小：动辄几个 GB，用 MB 读起来费劲，所以 1GB 起改用 GB。 */
+        function fmtVideoSize(n) {
+            var v = Number(n) || 0;
+            if (!v) return '';
+            if (v >= 1073741824) return (v / 1073741824).toFixed(2) + ' GB';
+            if (v >= 1048576) return Math.round(v / 1048576) + ' MB';
+            return fmtBytes(v);
+        }
+
+        /** 原图 pickcode 的取值守卫。
+            历史包袱：hub 与「文件夹缓存」两条路径都把**标记位**写进了 o 字段（`o: 1`，
+            注释原意是「这张图的原图要走 hub 代理」）。但 o 在所有消费点都只当作 pickcode 用 ——
+            拿 `1` 去签下载直链必然失败，还会把「缓存失败数」「联网次数」的统计带偏。
+            这里统一收口：只有长得像 pickcode 的字符串才算数。 */
+        function pickcodeOf(o) {
+            return (typeof o === 'string' && /^[A-Za-z0-9_-]{8,}$/.test(o)) ? o : '';
+        }
+
+        return {
+            escHtml: escHtml,
+            fmtBytes: fmtBytes,
+            fmtVideoSize: fmtVideoSize,
+            pickcodeOf: pickcodeOf
+        };
+    })();
+
+    var escHtml = MW115Core.escHtml, fmtBytes = MW115Core.fmtBytes, fmtVideoSize = MW115Core.fmtVideoSize, pickcodeOf = MW115Core.pickcodeOf;
+
+    /* ==== MW115_CORE:END ==== */
     function fmtTime(ts) {
         if (!ts) return '—';
         const d = new Date(ts);
@@ -1308,7 +1354,10 @@
         const ext = extOfBlob(blob, nameHint);
         let base = safeFilePart(nameHint || key);
         if (new RegExp('\\.' + ext + '$', 'i').test(base)) base = base.slice(0, -(ext.length + 1));
-        const fname = base + '.' + ext;
+        // 磁盘文件名必须唯一：缓存键是 pickcode，可「资产名」经常重
+        // （同一部片放在两个目录、同番号的正片/字幕版/4K 版）。都按资产名落盘的话
+        // 后写的会覆盖先写的，删一个 key 还会把另一个 key 的图连坐删掉 —— 所以拖上 key 尾缀。
+        const fname = base + '-' + String(key).slice(-8) + '.' + ext;
         const fh = await dirHandle.getFileHandle(fname, { create: true });
         const w = await fh.createWritable();
         await w.write(blob);
@@ -1321,9 +1370,12 @@
         if (dirFiles.img[key]) return dirFiles.img[key];
         if (!nameHint) return '';
         // 索引丢了也能按名字找回来（扩展名挨个试一遍）
+        const owned = Object.create(null);
+        Object.keys(dirFiles.img).forEach((k) => { owned[dirFiles.img[k]] = 1; });
         const base = safeFilePart(nameHint).replace(/\.[a-z0-9]{2,4}$/i, '');
         for (const ext of ['jpg', 'jpeg', 'png', 'webp']) {
             const cand = base + '.' + ext;
+            if (owned[cand]) continue;      // 已经归别人了 —— 按名字兜底会把两张图错配，宁可跳过
             try {
                 await dirHandle.getFileHandle(cand, { create: false });
                 dirFiles.img[key] = cand;
@@ -1347,6 +1399,9 @@
         delete dirFiles.img[key];
         markDirIndexDirty();
         if (!fname) return;
+        // 还有别的 key 指着同一个文件 → 只解绑索引，别顺手把别人的图删了
+        const stillUsed = Object.keys(dirFiles.img).some((k) => dirFiles.img[k] === fname);
+        if (stillUsed) return;
         try { await dirHandle.removeEntry(fname); } catch (e) { /* ignore */ }
     }
     async function folderPutNfo(key, text) {
@@ -1462,12 +1517,16 @@
         blobCache.clear();
         imgMeta = {};
         saveJson(STORE_IMG_META, {});
-        if (activeBackend() === 'folder') {
-            for (const k of Object.keys(dirFiles.img)) await folderDelImg(k);
+        // ⚠️ 两个后端都要清，不能只看当前用的是哪个：
+        // 清理 / 淘汰都以 imgMeta 为唯一索引，「另一个」后端里的实体数据一旦从索引里消失，
+        // 就再也没有任何路径能删掉它 —— 白占配额。切换过缓存位置的人最容易被坑。
+        const db = await openImgDB();
+        if (db) await idbReq(db, 'imgs', 'readwrite', (s) => s.clear());
+        if (dirHandle) {
+            for (const k of Object.keys(dirFiles.img)) {
+                try { await folderDelImg(k); } catch (e) { /* ignore */ }
+            }
             await writeDirIndex(true);
-        } else {
-            const db = await openImgDB();
-            if (db) await idbReq(db, 'imgs', 'readwrite', (s) => s.clear());
         }
     }
 
@@ -1527,16 +1586,16 @@
         return rawNfoCount;
     }
     async function clearRawNfo() {
-        if (activeBackend() === 'folder') {
+        // 同 clearImgCache：IDB 与「自选文件夹」都要清，否则换过后端就留下永远删不掉的孤儿
+        if (dirHandle) {
             for (const k of Object.keys(dirFiles.nfo)) {
                 try { await dirHandle.removeEntry(dirFiles.nfo[k]); } catch (e) { /* ignore */ }
                 delete dirFiles.nfo[k];
             }
             await writeDirIndex(true);
-        } else {
-            const db = await openImgDB();
-            if (db) await idbReq(db, 'texts', 'readwrite', (s) => s.clear());
         }
+        const db = await openImgDB();
+        if (db) await idbReq(db, 'texts', 'readwrite', (s) => s.clear());
         rawNfoCount = 0;
     }
 
@@ -1616,6 +1675,30 @@
     let nfoDirty = false;
     let nfoTimer = null;
 
+    /** NFO 缓存落盘。GM 单个存储值有上限（这里按 4.2MB 自保），几十个带剧情简介的 NFO
+        就容易顶到。原来写失败只 console.warn、而 dirty 标记已经先清零 —— 结果 UI 上条数看着
+        正常、关掉再开却要把全库 NFO 重新读一遍。现在：顶到上限就按「最久没用过」砍一半重试，
+        真写不进去就留下标记，好在设置里如实告诉用户。 */
+    let nfoPersistBlocked = false;
+    function persistNfo() {
+        pruneNfoStore();
+        if (saveJson(STORE_NFO, nfoStore)) { nfoPersistBlocked = false; return true; }
+        for (let round = 0; round < 6; round++) {
+            const keys = Object.keys(nfoStore);
+            if (!keys.length) break;
+            keys.sort((a, b) => (nfoStore[a].at || 0) - (nfoStore[b].at || 0));
+            keys.slice(0, Math.ceil(keys.length / 2)).forEach((k) => { delete nfoStore[k]; });
+            pruneNfoStore();
+            if (saveJson(STORE_NFO, nfoStore)) {
+                nfoPersistBlocked = false;
+                console.warn('[影片墙] NFO 缓存过大，已丢掉一半最旧的条目才写进去');
+                return true;
+            }
+        }
+        nfoPersistBlocked = true;
+        console.warn('[影片墙] NFO 缓存落盘失败：数据量超过 GM 存储上限，本次会话只在内存里有效');
+        return false;
+    }
     function markNfoDirty() {
         nfoDirty = true;
         if (nfoTimer) return;
@@ -1623,8 +1706,7 @@
             nfoTimer = null;
             if (!nfoDirty) return;
             nfoDirty = false;
-            pruneNfoStore();
-            saveJson(STORE_NFO, nfoStore);
+            persistNfo();
         }, 1500);
     }
     function pruneNfoStore() {
@@ -1661,14 +1743,13 @@
     const flushNfoStore = () => {
         if (!nfoDirty) return;
         nfoDirty = false;
-        pruneNfoStore();
-        saveJson(STORE_NFO, nfoStore);
+        persistNfo();
     };
     function nfoCacheStats() {
         const keys = Object.keys(nfoStore);
         let hit = 0;
         keys.forEach((k) => { if (nfoStore[k] && nfoStore[k].p) hit++; });
-        return { total: keys.length, hit: hit, bytes: JSON.stringify(nfoStore).length };
+        return { total: keys.length, hit: hit, bytes: JSON.stringify(nfoStore).length, blocked: nfoPersistBlocked };
     }
     function clearNfoCache() { nfoStore = {}; saveJson(STORE_NFO, {}); }
 
@@ -2152,7 +2233,9 @@
                     src: 'javdb', ts: Date.now()
                 });
             }
-            if (jd && !rec.mt) rec = Object.assign(rec || {}, { mt: Date.now() });
+            // jd 有结果但没封面时 rec 仍是 null —— 原来这里写 !rec.mt，
+            // 首次刮削 + 封面懒加载拿不到 src 就抛 TypeError，被上层空 catch 吞掉后卡片永久停在骨架屏
+            if (jd && (!rec || !rec.mt)) rec = Object.assign(rec || {}, { mt: Date.now() });
         }
         if ((!rec || !rec.c) && CFG.posterSource === 'javdb-first' && !isUncensored(code)) {
             const dmm = await probeDmm(code);
@@ -2199,7 +2282,8 @@
             if (r.miss && now - (r.ts || 0) > MISS_TTL_MS) return;
             const o = { ts: r.ts || now };
             if (r.c) o.c = r.c;
-            if (r.o) o.o = 1;
+            const realPc = pickcodeOf(r.o);
+            if (realPc) o.o = realPc;                 // 只写真 pickcode，不再写 `o: 1` 这种标记位
             if (r.t) o.t = r.t;
             if (r.tr) o.tr = r.tr;
             if (r.tg) o.tg = r.tg;
@@ -2401,11 +2485,12 @@
         return hubItemsCache.map;
     }
 
-    /** hub item → 内部 rec（o=1 表示原图需要走 hub 代理） */
+    /** hub item → 内部 rec。
+        ⚠️ 这里**不给 o 赋值**：hub 手里没有 115 的 pickcode，写 `o: 1` 会被下游当成 pickcode
+        去签下载直链（必失败 + 污染统计）。卡片需要用本地原图时由 sidecar 路径补。 */
     function hubItemToRec(it) {
         const rec = {
             c: String(it.poster_url || it.cover_url || ''),
-            o: 1,
             t: String(it.title || ''),
             d: String(it.release || it.year || ''),
             ac: (it.actors || []).join('・'),
@@ -2668,6 +2753,23 @@
     .mw-grid.mw-masonry{display:block;column-count:var(--mw-cols-n,5);column-gap:16px;}
     .mw-grid.mw-masonry .mw-card{break-inside:avoid;margin-bottom:16px;display:inline-block;width:100%;}
     .mw-grid.mw-auto{grid-template-columns:repeat(auto-fill,minmax(var(--mw-card-w,320px),1fr));}
+    /* ---- 紧凑列表视图（v3.15）：一行一片，缩略图贴左，标题/番号/路径占右边 ----
+       DOM 顺序是 [勾选框][海报][信息][悬浮操作]，用三列网格把它摊平；
+       海报纵向跨两行，让右边的「信息 + 操作」正好对着缩略图的高度。 */
+    .mw-grid.mw-list{display:block;column-count:auto;}
+    .mw-grid.mw-list .mw-card{display:grid;grid-template-columns:auto 76px minmax(0,1fr);
+      gap:10px;align-items:start;padding:8px 10px;margin-bottom:6px;border-radius:10px;}
+    .mw-grid.mw-list .mw-pick{position:static;width:22px;height:22px;background:transparent;border:0;margin-top:3px;}
+    .mw-grid.mw-list .mw-poster{grid-row:1 / span 2;width:76px;aspect-ratio:2/3;border-radius:7px;}
+    .mw-grid.mw-list .mw-portrait .mw-poster{aspect-ratio:2/3;}
+    .mw-grid.mw-list .mw-meta{grid-column:3;padding:0;min-width:0;}
+    .mw-grid.mw-list .mw-title{-webkit-line-clamp:2;min-height:0;font-size:13.5px;}
+    .mw-grid.mw-list .mw-path{margin-top:3px;}
+    .mw-grid.mw-list .mw-more{margin-top:4px;}
+    .mw-grid.mw-list .mw-acts{grid-column:3;position:static;display:flex;margin-top:4px;opacity:.7;}
+    .mw-grid.mw-list .mw-card:hover .mw-acts{opacity:1;}
+    .mw-grid.mw-list .mw-badge{font-size:10.5px;padding:2px 5px;left:4px;top:4px;}
+    .mw-grid.mw-list .mw-tr,.mw-grid.mw-list .mw-src{font-size:9px;padding:1px 4px;}
     .mw-card{background:#111722;border:1px solid #1d2634;border-radius:12px;overflow:hidden;cursor:pointer;
       transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease;position:relative;}
     .mw-fx .mw-card:hover{transform:translateY(-3px);border-color:#4b6bff;box-shadow:0 12px 30px rgba(0,0,0,.5);}
@@ -2938,7 +3040,7 @@
             makePlaceholder(card, badge ? badge.textContent : '?');
         };
         // 有 pickcode 就还有救（能按 pickcode 现取原图），别急着判死
-        if (!rec || (!rec.c && !rec.o)) { giveUp(); return; }
+        if (!rec || (!rec.c && !pickcodeOf(rec.o))) { giveUp(); return; }
         let img = $('img', box);
         if (!img) {
             img = document.createElement('img');
@@ -2974,8 +3076,9 @@
             let isLocalOriginal = false;
             // ① **本地已缓存的原图**（IndexedDB）—— 秒出，而且跟会过期的签名直链无关。
             //    重开影片墙走的常态就是这条。
-            if (rec.o && CFG.hiResPoster) {
-                src = await localImageUrl(rec.o, rec.on);
+            const origPc = pickcodeOf(rec.o);
+            if (origPc && CFG.hiResPoster) {
+                src = await localImageUrl(origPc, rec.on);
                 isLocalOriginal = !!src;
             }
             // ② sidecar 缩略图（115 签名直链，只有**刚从网盘列回来的**那批才有）
@@ -2985,7 +3088,7 @@
             if (src) {
                 img.setAttribute('src', src);
                 if (isLocalOriginal) img.dataset.hiRes = '1';    // 已经是原图了，不用再升级
-            } else if (!rec.o || !CFG.hiResPoster) {
+            } else if (!origPc || !CFG.hiResPoster) {
                 // 既没有现成图、也没有原图这条路可走 → 直接占位，别让骨架一直转
                 img.remove();
                 giveUp();
@@ -2993,9 +3096,9 @@
             }
         }
         // 换成网盘里的海报原图 —— 115 的缩略图直链最大只到 200px，卡片一大就糊
-        if (rec.o && CFG.hiResPoster && !img.dataset.hiRes) {
+        if (origPc && CFG.hiResPoster && !img.dataset.hiRes) {
             img.dataset.hiRes = '1';
-            upgradePosterToOriginal(img, rec.o, rec.on);
+            upgradePosterToOriginal(img, origPc, rec.on);
         }
         if (rec.tr && CFG.titleTranslate && !$('.mw-tr', box)) {
             const tag = document.createElement('span');
@@ -3139,9 +3242,13 @@
             const raw = img.getAttribute('data-art');
             if (!raw || /^https?:\/\/([^/]*\.)?115\.com/.test(raw)) continue;
             try {
-                const url = await coverURL({ c: raw });
+                // 原来是 coverURL(...) —— 全脚本没有这个函数的定义，每次都抛 ReferenceError
+                // 再被下面的空 catch 吞掉，表现就是详情面板的剧照/背景图永远直连、永远 403
+                const url = await coverSrc({ c: raw });
                 if (url && url !== raw && img.isConnected) img.setAttribute('src', url);
-            } catch (e) { /* 这张图显示不出来而已，不影响面板 */ }
+            } catch (e) {
+                console.warn('[影片墙] 详情图走 hub 代理失败（会退回直连）：', e && e.message);
+            }
         }
     }
 
@@ -3221,6 +3328,14 @@
                     setTimeout(pumpPosterQueue, 100);
                 });
         }
+    }
+
+    /** 把观察器连同它的观察目标一起甩掉（renderAll / closeOverlay 调用）。
+        这么做之前也从 renderAll 里漏写过 —— 见 ensureObserver 上方注释。 */
+    function dropPosterObserver() {
+        if (!posterObserver) return;
+        try { posterObserver.disconnect(); } catch (e) { /* ignore */ }
+        posterObserver = null;
     }
 
     function ensureObserver() {
@@ -3732,7 +3847,8 @@
     /** 海报阶段：列表里所有海报原图取回并落本地（并发 3）。已在本地的一张都不重下 */
     async function warmImgCache() {
         const st = cacheSt();
-        const todo = (state.items || []).filter((e) => e.rec && e.rec.o);
+        // 只挑真有 pickcode 的：`o` 可能是历史数据里的标记位（`o: 1`），那不是能下载的实体
+        const todo = (state.items || []).filter((e) => e.rec && pickcodeOf(e.rec.o));
         st.imgTotal = todo.length;
         st.imgDone = 0;
         st.phase = 'img';
@@ -3740,7 +3856,7 @@
         for (let i = 0; i < todo.length; i += 3) {
             if (st.stop) break;
             await Promise.all(todo.slice(i, i + 3).map(async (e) => {
-                const pc = e.rec.o;
+                const pc = pickcodeOf(e.rec.o);
                 const hint = e.rec.on;
                 try {
                     if (await imgCacheGet(pc, hint)) return;   // 已在本地 → 零请求
@@ -3812,6 +3928,9 @@
         const grid = $('#mw-grid');
         if (!grid) return;
         hideHover();
+        // 观察器先断开：只有「进入过视口」的卡片才会 unobserve，而没进过视口的那些
+        // 在 innerHTML 清空后再也不会相交 —— 不清 observer，它们连同闭包里的 entry/img 永远不能回收
+        dropPosterObserver();
         grid.innerHTML = '';
         (state.items || []).forEach((e) => { e._card = null; });   // 旧卡片节点已丢弃，别留引用
         // 列表换过（切目录 / 筛选 / 刷新 / 批量操作后）→ 把已经不在列表里的勾选清掉
@@ -3840,6 +3959,12 @@
         const cols = Number(CFG.columns) || 0;
         grid.classList.toggle('mw-auto', cols === 0);
         grid.classList.toggle('mw-masonry', !!CFG.masonry);
+        // 列表视图自带版式，瀑布流/列数在它身上没意义 —— 类名互斥，避免两套 display 打架
+        const isList = CFG.listView === 'list';
+        grid.classList.toggle('mw-list', isList);
+        if (isList) grid.classList.remove('mw-masonry');
+        const viewBtn = $('[data-act="toggle-view"]');
+        if (viewBtn) viewBtn.textContent = isList ? '海报墙' : '紧凑列表';
         grid.style.setProperty('--mw-card-w', (Number(CFG.cardW) || 320) + 'px');
         if (cols > 0) {
             grid.style.setProperty('--mw-cols', String(cols));
@@ -4080,6 +4205,7 @@
             renderAll();
             const hit = await hydrateFromHub(state.items);
             if (hit) renderAll();
+            maybeAutoCacheLocal();          // v3.14：全库模式也要自动本地化（原来只有目录模式会做）
             const ageMin = Math.round((Date.now() - cached.ts) / 60000);
             const ttl = Math.max(0, Number(CFG.libCacheMin) || 0) * 60000;
             if (Date.now() - cached.ts < ttl) {
@@ -4121,6 +4247,7 @@
         } catch (e) {
             toast('扫描失败：' + e.message, 'error', 4000);
         } finally { setBusy(false); }
+        maybeAutoCacheLocal();              // 扫完就地把素材写本地，不用等用户手点
     }
 
     /** 后台重扫：索引没变就什么都不做（不重渲染、不打扰） */
@@ -4185,6 +4312,7 @@
                 { t: 'range', k: 'cardW', name: '卡片宽度', min: 200, max: 520, step: 20, fmt: (v) => v + 'px', hint: '自适应模式下由它决定一行放几张' },
                 { t: 'range', k: 'pageWidth', name: '内容宽度', min: 60, max: 100, step: 1, fmt: (v) => v + '%', hint: '海报墙整体宽度占页面的比例' },
                 { t: 'toggle', k: 'masonry', name: '瀑布流', hint: '按列排布、卡片高度各自撑开' },
+                { t: 'select', k: 'listView', name: '视图', options: [['wall', '海报墙'], ['list', '紧凑列表']], hint: '紧凑列表 = 一行一部（左侧小缩略图 + 右侧番号/标题/目录），同样支持勾选、批量移动删除、悬浮操作与详情面板。库大、想快速按番号扫一遍时更好用。拖动工具栏上的「紧凑列表 / 海报墙」按钮也能随时切' },
                 { t: 'toggle', k: 'showPath', name: '显示所在目录', hint: '在全库模式下标注影片来自哪个子目录' },
                 { t: 'toggle', k: 'showFileName', name: '显示原始文件名', hint: '在标题下方补一行原始文件名' },
                 { t: 'toggle', k: 'showSize', name: '显示文件大小', hint: '115 列目录时就会带回大小，零额外请求' },
@@ -4292,7 +4420,12 @@
         saveJson(STORE_DIR + cid, payload);
         if (dirKeys.indexOf(String(cid)) < 0) {
             dirKeys.push(String(cid));
-            if (dirKeys.length > 400) dirKeys = dirKeys.slice(-400);
+            if (dirKeys.length > 400) {
+                // 挤出去的 cid 必须顺便把它的缓存删掉：GM 存储没有枚举 API，
+                // 「用过的 cid」这份索引是清理时唯一的线索 —— 漏了这个就是永久占用的垃圾。
+                dirKeys.splice(0, dirKeys.length - 400)
+                    .forEach((old) => { try { GM_deleteValue(STORE_DIR + old); } catch (e) { /* ignore */ } });
+            }
             saveJson(STORE_DIR_INDEX, dirKeys);
         }
     }
@@ -4412,11 +4545,13 @@
             }
 
             // ⑧c 本地缓存落点：让用户一眼看到素材到底存在哪
+            const nfStat = nfoCacheStats();
             push('⑧c 缓存位置：' + (activeBackend() === 'folder'
                 ? ('本机文件夹「' + (dirHandle && dirHandle.name || '') + '」（NFO 原文 ' +
                     Object.keys(dirFiles.nfo).length + ' 份 · 海报 ' + Object.keys(dirFiles.img).length + ' 张）')
-                : '浏览器本地 IndexedDB（片名 ' + nfoCacheStats().hit + ' 条 · NFO 原文 ' + rawNfoCount +
+                : '浏览器本地 IndexedDB（片名 ' + nfStat.hit + ' 条 · NFO 原文 ' + rawNfoCount +
                   ' 份 · 海报 ' + imgCacheCount() + ' 张 / ' + fmtBytes(imgCacheBytes()) + '）'));
+            if (nfStat.blocked) push('   ⚠ NFO 缓存撑爆了 GM 存储上限，这次的解析结果没能写盘 —— 关掉后会重新读一遍');
             if (folderMode() && activeBackend() !== 'folder') push('   ⚠ ' + folderBlockReason() + ' → 现在临时用浏览器本地');
 
             push('⑨ 统计：NFO 已解析 ' + items.filter((e) => e.rec && e.rec.nfo).length +
@@ -5128,6 +5263,28 @@
         }
     }
 
+    /** 键盘：只往 document 挂一次。
+        原来这段写在 buildOverlay 里，每重开一次墙就多一个匿名监听；而每个监听的闭包都
+        留住上一棵已经 remove 掉的 overlay 树（整墙卡片 + img + 事件回调），反复开关会稳定泄漏。
+        改成回调内部自己按 id 找当前 overlay，就跟 overlay 的生命周期解耦了。 */
+    let mwKeysBound = false;
+    function bindOverlayKeys() {
+        if (mwKeysBound) return;
+        mwKeysBound = true;
+        document.addEventListener('keydown', (e) => {
+            const ov = $('#mw-overlay');
+            if (!ov) return;
+            if (e.key === 'Escape') {
+                if ($('#mw-set-overlay')) $('#mw-set-overlay').remove();
+                else closeOverlay();
+            } else if (e.key === '/' && document.activeElement !== $('.mw-search', ov)) {
+                e.preventDefault();
+                const s = $('.mw-search', ov);
+                if (s) s.focus();
+            }
+        });
+    }
+
     function buildOverlay() {
         if ($('#mw-overlay')) return;
         const ov = document.createElement('div');
@@ -5151,6 +5308,7 @@
                     <option value="random">随机排序</option>
                 </select>
                 <button class="mw-btn" data-act="shuffle" style="display:none" title="重新洗牌（随机排序）">换一批</button>
+                <button class="mw-btn" data-act="toggle-view" title="海报墙 ⇄ 紧凑列表（一行一片，扫番号更快；选择会记住）">紧凑列表</button>
                 <button class="mw-btn" data-act="setroot">设为库根目录</button>
                 <button class="mw-btn" data-act="diag">自检</button>
                 <button class="mw-btn" data-act="settings">设置</button>
@@ -5241,6 +5399,14 @@
                     renderAll();
                     toast('已重新洗牌', 'info', 1600);
                 }
+                else if (act === 'toggle-view') {
+                    CFG.listView = (CFG.listView === 'list') ? 'wall' : 'list';
+                    saveCfg();
+                    // 版式本身是纯 CSS 的事，但两种视图一行能装下的卡片数差很多，
+                    // 惰性渲染的批次得按新高度重来，所以直接整页重渲染（重建 48 张，代价可接受）。
+                    renderAll();
+                    toast(CFG.listView === 'list' ? '已切到紧凑列表' : '已切回海报墙', 'info', 1500);
+                }
                 else if (act === 'pick-all') pickAllVisible();
                 else if (act === 'pick-none') clearSelection();
                 else if (act === 'pick-target') pickTargetDir();
@@ -5260,16 +5426,7 @@
             const el = e.target;
             if (el.scrollTop + el.clientHeight > el.scrollHeight - 500 && state.rendered < state.filtered.length) renderMore();
         });
-        document.addEventListener('keydown', (e) => {
-            if (!$('#mw-overlay')) return;
-            if (e.key === 'Escape') {
-                if ($('#mw-set-overlay')) $('#mw-set-overlay').remove();
-                else closeOverlay();
-            } else if (e.key === '/' && document.activeElement !== $('.mw-search', ov)) {
-                e.preventDefault();
-                $('.mw-search', ov).focus();
-            }
-        });
+        bindOverlayKeys();                           // 键盘一次挂载，不随 overlay 反复注册
         state.overlayOpen = true;
     }
 
@@ -5289,6 +5446,7 @@
         const ov = $('#mw-overlay');
         if (ov) ov.remove();
         state.overlayOpen = false;
+        dropPosterObserver();                        // overlay 整棵树都要丢，观察目标更不能留着
         clearCoverBlobs();
         if (posterDirty) { posterDirty = false; stripVolatileFromPosterCache(); saveJson(STORE_POSTER, posterCache); }
         if (transDirty) { transDirty = false; saveJson(STORE_TRANS, transCache); }

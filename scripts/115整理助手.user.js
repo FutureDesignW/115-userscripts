@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name            115整理助手 (115Rename2026 + 递归整理)
 // @namespace       https://github.com/liuchanghuaX1/115Rename2026
-// @version         2.6.0
-// @description     在 115Rename2026 基础上整合「递归整理」：递归扫描当前目录及全部子目录 → 去掉文件名里的干扰词 → 抽取番号 → 视频汇总到当前目录 → 按所选「重命名方式」改名（本地优先，缺信息的条目才联网） → 清空已空的子目录。重命名方式 7 种可选，并支持**在整理预览面板里就地自定义模板**（`{code}{title}{actress}{date}{rating}{markers}` 变量按钮、实时重算、不联网）
+// @version         2.8.0
+// @description     在 115Rename2026 基础上整合「递归整理」：递归扫描当前目录及全部子目录 → 去掉文件名里的干扰词 → 抽取番号 → 视频汇总到当前目录 → 按所选「重命名方式」改名（本地优先，缺信息的条目才联网） → 清空已空的子目录。重命名方式 7 种可选，并支持**在整理预览面板里就地自定义模板**（`{code}{title}{actress}{date}{rating}{markers}` 变量按钮、实时重算、不联网）。改名后可在菜单里**一键撤销上次改名**。
 // @author          sonarlee (原始引擎) + 递归整理整合
 // @include         https://115.com/*
 // @icon            https://115.com/favicon.ico
@@ -595,9 +595,21 @@
     const CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
     const NEGATIVE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
+    /** 读缓存。⚠️ 必须吞掉解析异常：这份数据在 IIFE 初始化阶段就要读（jb_infoCache 等），
+        GM 存储里一旦存进了半截/坏掉的 JSON（存储配额满、跨版本残留），
+        JSON.parse 一抛就是「整个脚本再也起不来」——入口按钮直接消失，用户只会以为脚本坏了。 */
     const getCache = (key) => {
-        const cache = JSON.parse(GM_getValue(key, '{}'));
-        return cache;
+        try {
+            const raw = GM_getValue(key, '{}');
+            if (!raw) return {};
+            const parsed = JSON.parse(raw);
+            // 不是对象就当没数据（比如旧版本存过字符串），别让下游崩在 Object.keys 上
+            return (parsed && typeof parsed === 'object') ? parsed : {};
+        } catch (e) {
+            console.warn('[整理助手] 缓存损坏已忽略，from scratch：' + key, e && e.message);
+            try { GM_setValue(key, '{}'); } catch (e2) { /* ignore */ }
+            return {};
+        }
     };
     const setCache = (key, data) => GM_setValue(key, JSON.stringify(data));
 
@@ -1705,17 +1717,79 @@
     // 12. 发送修改请求
     // ========================================================================
     let renameCompareList = [];
-    const send_115 = (id, name, fh, origFilename, callback) => {
+
+    // ---- 改名回滚日志 ----
+    // 只留「最近一批」改名（每个新批次开始时会重置），所以菜单叫「撤销上次改名」而不是「改名历史」。
+    // 存 fid + 原名 + 新名；回滚 = 拿 fid 把文件名改回去。落 GM 存储，刷新页面也还在。
+    const ROLLBACK_KEY = 'jb_renameJournal';
+    const ROLLBACK_MAX = 800;
+    let renameJournal = loadRenameJournal();
+    let journalDirty = false;
+    let journalTimer = null;
+
+    function loadRenameJournal() {
+        try {
+            const raw = GM_getValue(ROLLBACK_KEY, '[]');
+            const arr = raw ? JSON.parse(raw) : [];
+            // 过滤残条目：缺 fid/from/to 的记回去也没用（改不了名）
+            return Array.isArray(arr) ? arr.filter(e => e && e.fid && e.from && e.to) : [];
+        } catch (e) {
+            console.warn('[整理助手] 回滚日志损坏，已重置', e && e.message);
+            try { GM_setValue(ROLLBACK_KEY, '[]'); } catch (e2) { /* ignore */ }
+            return [];
+        }
+    }
+    function saveRenameJournalNow() {
+        if (!journalDirty) return;
+        journalDirty = false;
+        try { GM_setValue(ROLLBACK_KEY, JSON.stringify(renameJournal)); }
+        catch (e) { console.warn('[整理助手] 回滚日志写入失败', e && e.message); }
+    }
+    // 一次改名动辄几百个文件，别每成功一个就写一次 GM 存储
+    function markRenameJournalDirty() {
+        journalDirty = true;
+        if (journalTimer) return;
+        journalTimer = setTimeout(() => { journalTimer = null; saveRenameJournalNow(); }, 1200);
+    }
+    function resetRenameJournal() {
+        renameJournal = [];
+        journalDirty = true;
+        saveRenameJournalNow();
+    }
+
+    const send_115 = (id, name, fh, origFilename, callback, opts) => {
         const fn = name.replace(/[\\/:*?"<>|]/g, (c) => ({ '\\': '', '/': ' ', ':': ' ', '?': ' ', '"': ' ', '<': ' ', '>': ' ', '|': '' })[c] || '');
+        // ⚠️ 必须保证 callback **一定被调用且只调用一次**：
+        // 原来这里裸 JSON.parse(data) —— 115 偶发返回登录页/风控页 HTML 或空串，一抛异常
+        // callback 就永远不触发，runTasksWithLimit 停在原地等回调，
+        // renameInProgress 跟着永久锁死（表现为进度条卡住、只能刷新页面）。
+        let settled = false;
+        // callback 收一个布尔：这次改名到底成没成（回滚要用它决定哪些条目能被反向记录）
+        const finish = (ok) => { if (settled) return; settled = true; if (typeof callback === 'function') callback(ok); };
         $.post('https://webapi.115.com/files/edit', { fid: id, file_name: fn }, data => {
-            const r = JSON.parse(data);
-            if (!r.state) showPageNotification(`${fh} 修改失败: ${r.error}`, 'error', 3000);
-            else {
-                showPageNotification(`${fh} 修改成功`, 'success', 2000);
-                if (origFilename) renameCompareList.push({ original: origFilename, new: name });
+            let success = false;
+            try {
+                let r = null;
+                try {
+                    r = (typeof data === 'string') ? JSON.parse(data) : data;
+                } catch (e) {
+                    r = { state: false, error: '响应不是 JSON（可能已被风控拦截）' };
+                }
+                if (!r || !r.state) showPageNotification(`${fh} 修改失败: ${(r && r.error) || '未知错误'}`, 'error', 3000);
+                else {
+                    success = true;
+                    showPageNotification(`${fh} 修改成功`, 'success', 2000);
+                    if (origFilename) renameCompareList.push({ original: origFilename, new: name });
+                    if (origFilename && id && !(opts && opts.noJournal)) {
+                        renameJournal.push({ fid: String(id), from: origFilename, to: name, ts: Date.now() });
+                        if (renameJournal.length > ROLLBACK_MAX) renameJournal = renameJournal.slice(-ROLLBACK_MAX);
+                        markRenameJournalDirty();
+                    }
+                }
+            } finally {
+                finish(success);
             }
-            if (typeof callback === 'function') callback();
-        }).fail(() => { showPageNotification(`${fh} 请求失败`, 'error', 3000); if (typeof callback === 'function') callback(); });
+        }).fail(() => { showPageNotification(`${fh} 请求失败`, 'error', 3000); finish(false); });
     };
 
     // ========================================================================
@@ -1964,6 +2038,7 @@
             if (finishCalled) return;
             finishCalled = true;
             progressBox.finish();
+            saveRenameJournalNow();   // 批次结束立刻落盘，别等那个 1.2s 的防抖定时器
             showPageNotification(`所有文件处理完成`, 'success', 5000);
             persistCaches();
             offerCompareExport();
@@ -1980,6 +2055,7 @@
             if (!rows.length) { cancelRename(); return; }
             progressBox.init(isLocal ? '本地番号加工' : '联网改名', rows.length);
             renameCompareList = [];
+            resetRenameJournal();   // 新批次开始：回滚日志只认「最近一批」
             let processed = 0;
             const tasks = rows.map(row => done => {
                 send_115(row.item.fid, row.newName, row.item.vi.fullCode, row.item.fn, () => {
@@ -2513,7 +2589,9 @@
                 if (m) return m[1];
             }
         } catch (e) { /* ignore */ }
-        return '0';
+        // 取不到就如实返回 null —— 原来静默兜成 '0'（根目录），一旦页面 URL 结构变了，
+        // 整理会把整个网盘当成「当前目录」去汇总文件、删空目录，代价太大。
+        return null;
     };
 
     /** 列出一个目录的全部条目（自动翻页） */
@@ -2535,10 +2613,13 @@
         return all;
     };
 
-    /** 递归扫描目录树（有 fid = 文件；无 fid = 子目录） */
+    /** 递归扫描目录树（有 fid = 文件；无 fid = 子目录）
+        ⚠️ listed 记录「真正成功列过的目录 cid」—— 后面判空目录时全靠它兜命：
+        请求失败 / 超深度 / 撞上限而没被列过的目录，里面有什么是**未知的**，绝不能当空目录删掉。 */
     const scanTree = async (rootCid, onTick) => {
         const files = [];
         const dirs = [];
+        const listed = new Set();
         const queue = [{ cid: String(rootCid), path: '', depth: 0 }];
         let visited = 0;
         while (queue.length) {
@@ -2551,6 +2632,7 @@
             let list = [];
             try { list = await listDirAll(cur.cid); }
             catch (e) { showPageNotification(`读取「${cur.path || '当前目录'}」失败：${e.message}`, 'error', 4000); continue; }
+            listed.add(cur.cid);         // 只有走到这里才算「看过内容」
             list.forEach(it => {
                 const name = String(it.n || it.name || '');
                 if (!name) return;
@@ -2568,7 +2650,7 @@
             visited++;
             if (onTick) onTick(visited);
         }
-        return { files: files, dirs: dirs };
+        return { files: files, dirs: dirs, listed: listed };
     };
 
     /** 批量移动到目标目录 */
@@ -2618,6 +2700,9 @@
         const isEmpty = (cid) => {
             if (memo.has(cid)) return memo.get(cid);
             memo.set(cid, false);
+            // 没成功列过 → 内容未知。宁可不删，也不能把一整个子树判成「空」删掉。
+            // （父目录同理会被拖成非空，因为 kids.every(isEmpty) 必然为 false）
+            if (tree.listed && !tree.listed.has(cid)) return false;
             const hasContent = onlyNoVideo ? (videoCount.get(cid) || 0) > 0 : (fileCount.get(cid) || 0) > 0;
             if (hasContent) return false;
             const kids = children.get(cid) || [];
@@ -2941,6 +3026,8 @@
             opts.removeNoVideo = false;
         }
         progressBox.init('整理中', todo.length);
+        renameCompareList = [];
+        resetRenameJournal();   // 整理也算一次改名批次
         let processed = 0, renamed = 0, moved = 0;
 
         const needMove = todo.filter(r => String(r.item.srcCid) !== String(rootCid));
@@ -2964,12 +3051,22 @@
                     const fresh = await scanTree(rootCid);
                     const empties = findEmptyDirs(fresh, !!opts.removeNoVideo);
                     if (empties.length) {
-                        const byParent = new Map();
-                        empties.forEach(d => {
-                            if (!byParent.has(d.parentCid)) byParent.set(d.parentCid, []);
-                            byParent.get(d.parentCid).push(d.cid);
-                        });
-                        for (const [pid, cids] of byParent) deleted += await deleteItems(pid, cids);
+                        // 删除不可逆 —— 先把待删清单摆出来让用户过一眼，别默默删
+                        const preview = empties.slice(0, 12).map(d => '· ' + (d.path || d.name)).join('\n') +
+                            (empties.length > 12 ? `\n· …共 ${empties.length} 个` : '');
+                        const go = confirm(
+                            `准备删除 ${empties.length} 个子目录（均已重新列目录确认过里面没有文件）：\n\n${preview}\n\n确定删除？`
+                        );
+                        if (go) {
+                            const byParent = new Map();
+                            empties.forEach(d => {
+                                if (!byParent.has(d.parentCid)) byParent.set(d.parentCid, []);
+                                byParent.get(d.parentCid).push(d.cid);
+                            });
+                            for (const [pid, cids] of byParent) deleted += await deleteItems(pid, cids);
+                        } else {
+                            showPageNotification('已跳过删除子目录（改名/移动已完成）', 'info', 4000);
+                        }
                     }
                     keptDirs = Math.max(0, fresh.dirs.length - deleted);
                 }
@@ -2983,7 +3080,57 @@
                 setCache('jb_negativeCache', negativeCache);
             } catch (e) { /* ignore */ }
             progressBox.finish();
+            saveRenameJournalNow();
             showPageNotification(`整理完成：改名 ${renamed} 个，移动 ${moved} 个，删除空目录 ${deleted} 个${keptDirs ? `，保留 ${keptDirs} 个非空子目录` : ''}`, 'success', 8000);
+            window.renameInProgress = false;
+        });
+    };
+
+    /** 撤销上次改名（回滚）
+        - 只认「最近一批」，逐条把文件名改回去；不改位置（文件不会自己回到原子目录）
+        - 回滚本身也能再撤销一次（成功后把反向映射写回日志，等于一个来回切换的开关）
+        - 这是不可逆操作，先弹清单让用户过目再动手 */
+    const undoLastRename = () => {
+        if (window.renameInProgress) { showPageNotification('有任务正在进行中，稍后再试', 'info', 2000); return; }
+        const list = loadRenameJournal();   // 以存储为准，避免内存与落盘不一致
+        if (!list.length) { showPageNotification('没有可回滚的改名记录（只有「最近一批」会被记住）', 'info', 3500); return; }
+
+        const preview = list.slice(-10).map(e => `· ${e.to}\n   → ${e.from}`).join('\n') +
+            (list.length > 10 ? `\n· …共 ${list.length} 个` : '');
+        if (!confirm(
+            `将把最近一批改名的 ${list.length} 个文件改回原名：\n\n${preview}\n\n` +
+            '注意：\n' +
+            '· 只改文件名，不会把文件移回原来的子目录\n' +
+            '· 若其中某个文件在这之后又被改名过，回滚会覆盖那次改动\n' +
+            '· 本次回滚结束后，再点一次可「反悔」把名字改回来\n\n' +
+            '确定回滚？'
+        )) return;
+
+        window.renameInProgress = true;
+        renameCompareList = [];
+        progressBox.init('回滚改名', list.length);
+        let processed = 0, okCount = 0;
+        const inverse = [];   // 成功的条目反向记录，供「再撤销一次」用
+        const tasks = list.map(e => done => {
+            // origFilename 传 e.to：回滚对比也能导出；noJournal 防止回滚把日志再覆盖一遍
+            send_115(e.fid, e.from, e.fid, e.to, (ok) => {
+                processed++;
+                if (ok) { okCount++; inverse.push({ fid: e.fid, from: e.to, to: e.from, ts: Date.now() }); }
+                progressBox.update(processed);
+                done();
+            }, { noJournal: true });
+        });
+        runTasksWithLimit(tasks, 3, 200, () => {
+            renameJournal = inverse;
+            journalDirty = true;
+            saveRenameJournalNow();
+            progressBox.finish();
+            showPageNotification(
+                okCount === list.length
+                    ? `回滚完成：${okCount} 个文件已改回原名`
+                    : `回滚结束：成功 ${okCount} / ${list.length} 个（失败的多半是被 115 风控拦了，稍后可重试）`,
+                okCount ? 'success' : 'error', 5000
+            );
             window.renameInProgress = false;
         });
     };
@@ -2997,6 +3144,10 @@
         const opt = (typeof opts === 'object' && opts) ? opts : { network: !!opts };
         const cfg = Object.assign({ network: true, addDate: true, translateChinese: false }, opt);
         if (window.renameInProgress) { showPageNotification('已有任务正在进行中，请等待完成', 'info', 2000); return; }
+        if (!getCurrentCid()) {
+            showPageNotification('读不到当前目录（cid 解析失败），已中止 —— 这样整理才不会落到整个网盘根目录下', 'error', 6000);
+            return;
+        }
         window.renameInProgress = true;
         const rootCid = getCurrentCid();
         progressBox.init('扫描子目录', 60);
@@ -3112,9 +3263,71 @@
         if (wire) wire(overlay);
     };
 
-    /** 极简 HTML 转义（对话框与面板共用；只用来塞标题/标签这类文本） */
-    const escHtml = (s) => String(s == null ? '' : s)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    /* ==== MW115_CORE:BEGIN ==== */
+    /* =============================================================================
+     * 115 系列油猴脚本 —— 公共核心
+     * -----------------------------------------------------------------------------
+     * ⚠️ 这是**源码**，不要直接拖进 Tampermonkey 安装。
+     *    正式交付的 scripts/*.user.js 由 `node tools/build.js` 把本文件内联进去生成。
+     *
+     * 只放「纯函数」：不吃 GM_*、不碰 DOM、不联网 —— 这样
+     *   ① 三个脚本不会因为各自手写一份而悄悄走偏（之前最常出问题就在这种地方）
+     *   ② 能用 `node --test tests/` 在 Node 里直接跑用例
+     *   ③ 内联后就是同一闭包里的几个普通变量，零运行时开销
+     *
+     * 内联形态（build.js 生成）：本文件原样贴进去得到 `var MW115Core`，
+     * 随后紧跟一行把导出名字绑到本地变量 —— 脚本里的调用点一个字都不用改。
+     * 注意：别把它改成 UMD 那套（挂到 root.XxxCore 上），那样闭包里拿不到名字，
+     * 编译检查也照样通过，只有真正跑到页面上才发现 ReferenceError。
+     * ========================================================================== */
+    var MW115Core = (function () {
+        'use strict';
+
+        /** HTML 转义。
+            两个脚本原来各写一份：整理助手那份**漏了单引号**，拼进 `title="${...}"` 时
+            遇到带撇号的片名就能把属性提前闭合。统一按最严的一份来。 */
+        var ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+        function escHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ESC_MAP[c]; });
+        }
+
+        /** 字节数 → 人类可读。 */
+        function fmtBytes(n) {
+            if (!n) return '0 B';
+            if (n < 1024) return n + ' B';
+            if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+            return (n / 1048576).toFixed(2) + ' MB';
+        }
+
+        /** 视频文件大小：动辄几个 GB，用 MB 读起来费劲，所以 1GB 起改用 GB。 */
+        function fmtVideoSize(n) {
+            var v = Number(n) || 0;
+            if (!v) return '';
+            if (v >= 1073741824) return (v / 1073741824).toFixed(2) + ' GB';
+            if (v >= 1048576) return Math.round(v / 1048576) + ' MB';
+            return fmtBytes(v);
+        }
+
+        /** 原图 pickcode 的取值守卫。
+            历史包袱：hub 与「文件夹缓存」两条路径都把**标记位**写进了 o 字段（`o: 1`，
+            注释原意是「这张图的原图要走 hub 代理」）。但 o 在所有消费点都只当作 pickcode 用 ——
+            拿 `1` 去签下载直链必然失败，还会把「缓存失败数」「联网次数」的统计带偏。
+            这里统一收口：只有长得像 pickcode 的字符串才算数。 */
+        function pickcodeOf(o) {
+            return (typeof o === 'string' && /^[A-Za-z0-9_-]{8,}$/.test(o)) ? o : '';
+        }
+
+        return {
+            escHtml: escHtml,
+            fmtBytes: fmtBytes,
+            fmtVideoSize: fmtVideoSize,
+            pickcodeOf: pickcodeOf
+        };
+    })();
+
+    var escHtml = MW115Core.escHtml, fmtBytes = MW115Core.fmtBytes, fmtVideoSize = MW115Core.fmtVideoSize, pickcodeOf = MW115Core.pickcodeOf;
+
+    /* ==== MW115_CORE:END ==== */
 
     /** 模板变量表（设置对话框与整理面板共用：按钮上的文字 / 提示） */
     const NAMING_VARS = [
@@ -3263,9 +3476,11 @@
                 refresh();
             });
             overlay.querySelector('#nd-learn').addEventListener('click', () => {
+                const cid = getCurrentCid();
+                if (!cid) { msg.textContent = '读不到当前目录，无法学习'; return; }
                 msg.textContent = '正在读取当前目录…';
                 apiGet115('/files', {
-                    aid: 1, cid: getCurrentCid(), limit: 1150, show_dir: 1,
+                    aid: 1, cid: cid, limit: 1150, show_dir: 1,
                     format: 'json', o: 'file_name', asc: 1, natsort: 1, cur: 1
                 }).then(json => {
                     const arr = (json && Array.isArray(json.data)) ? json.data : [];
@@ -3298,6 +3513,7 @@
             <a id="set_archive_root" class="mark" href="javascript:;">设为归档根目录</a>
             <a id="get_javdb_rating" class="mark" href="javascript:;">获取javdb评分</a>
             <a id="backup_file_names" class="mark" href="javascript:;">备份文件名</a>
+            <a id="undo_last_rename" class="mark" href="javascript:;">撤销上次改名(回滚)</a>
             <a id="organize_recursive" class="mark" href="javascript:;">整理并重命名(含子目录)</a>
             <a id="organize_recursive_pure" class="mark" href="javascript:;">整理并重命名(含子目录·纯本地)</a>
             <a id="organize_naming_mode" class="mark" href="javascript:;">重命名方式设置</a>
@@ -3320,6 +3536,7 @@
             $("a#set_archive_root").off("click").on("click", setArchiveRoot);
             $("a#get_javdb_rating").off("click").on("click", getJavdbRating);
             $("a#backup_file_names").off("click").on("click", backupFileNames);
+            $("a#undo_last_rename").off("click").on("click", undoLastRename);
             $("a#organize_recursive").off("click").on("click", () => organizeRecursive({ network: true }));
             $("a#organize_recursive_pure").off("click").on("click", () => organizeRecursive({ network: false }));
             $("a#organize_naming_mode").off("click").on("click", () => showNamingModeDialog());
@@ -3350,6 +3567,7 @@
             noiseDictSummary, noiseTokens, NOISE_SEEDS, MARKER_MAP, markerOf,
             NAMING_MODES, DEFAULT_NAMING_TEMPLATE, namingModeOf, namingHasTitle, NAMING_VARS, insertAtCursor,
             manualNameProtected,
+            undoLastRename, getRenameJournal: () => loadRenameJournal(),
             buildOrganizeRows, recomputeRow, recomputeAllRows, rowsNeedingRemote, fillMissingRows,
             organizeRecursive, showNamingModeDialog, showNoiseDictDialog, showOrganizePreview,
             getNamingCfg: () => namingCfg, setNamingCfg: (o) => { namingCfg = Object.assign(namingCfg, o); saveNamingCfg(); },
@@ -3357,5 +3575,5 @@
         };
     } catch (e) { /* ignore */ }
 
-    console.log('115整理助手 v2.6.0 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板）');
+    console.log('115整理助手 v2.8.0 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚）');
 })();
