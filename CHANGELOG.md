@@ -11,6 +11,68 @@
 
 ---
 
+## 115影片墙 v3.16.0 / 115整理助手 v2.9.0（2026-10-06）
+
+**入口从右下角悬浮球搬到 115 顶部工具栏。**
+
+之前两个脚本都在右下角各丢一个悬浮球（影片墙 `bottom:148px`、整理 `bottom:88px`），
+问题很实际：挡住文件列表；115 自己的操作区就在顶栏第一行，用户的手先到的地方根本看不到它们；
+两个球上下叠着，越装越多。
+
+**怎么找到顶栏的**
+
+115 新版是 Tailwind + SPA，class 每次构建都在变，靠 class 定位等于每次上线都要修。
+这次借用了 JAV 老司机 v2.8.8 在 115 上的做法 —— **用 `title` 文案反查**：
+
+| | 定位方式 | 插入点 |
+|---|---|---|
+| 新版顶栏 | `.justify-between.w-full.pl-6.pr-5` 容器里的 `button[title="更多操作"]`，取它的 `parentElement` | 插在 `button[title="列表视图"]` 那一组之前 |
+| 老版顶栏 | `#js_top_panel_box .left-tvf[rel="left_tvf"]` | 插在 `.master-preview-switch-btn` 之后 |
+
+「更多操作 / 列表视图」是产品定死的文案，比 Tailwind 原子类稳得多。
+
+隐藏的那套顶栏（115 同时存在桌面版 / 移动版 DOM，只 `display:none` 掉一套）会被跳过 ——
+不然按钮就插进看不见的那一套，页面上等于没挂。
+
+**定位失败也不丢入口**：多路降级（title 锚点 → class 候选 → 文本锚点上溯 → 同源 iframe）
+全失败才退回右下角悬浮球。115 是 SPA，切目录会整块重建顶栏，所以还挂着 1.5s 一轮的
+重挂巡逻，重新定位一次发现 slot 掉了就补挂。
+
+**两个脚本的菜单**
+
+- 影片墙：4 项（打开影片墙 / 影片墙设置 / 设为影片库根目录 / 自检读取链路），
+  与原有的 `GM_registerMenuCommand` 一一对应。
+- 整理助手：13 项全部搬进下拉，顺序跟右键菜单一致；**右键菜单保留不动**，
+  当作工具栏挂不上时的第二条路。
+
+按钮尺寸对齐 115 原生按钮（32px 高 / 14px 字），不然一排 28px 小按钮夹在原生按钮里会明显矮一截。
+
+**顺手修的缺陷**
+
+| # | 现象 | 原因 |
+|---|---|---|
+| 1 | 工具栏下拉菜单项点了没反应 | 菜单项的 click handler 里引用了外层的 `slot` 变量 —— 那个作用域在 `makeButton` 里拿不到，一点击就抛 ReferenceError。改成从事件目标 `closest('.mw115-tb-slot')` 反查 |
+| 2 | `isDisplayed` 在 Node 里直接抛 `window is not defined` | 硬引用 `window.getComputedStyle`。单测 require 这个文件就炸，连带其他用例全挂。已 try/catch 兜住 |
+| 3 | `tools/build.js` 静默失效 | `markerName()` 拼出的是 `MW115_115_CORE`（文件名里的 `115` 跟前缀重复），标记一个都匹配不上，脚本却「已是最新」地过去了 —— 改核心源码完全没反应。已修 + 加两道反向校验：脚本摆的标记区必须有对应核心，否则报错 |
+| 4 | toolbar 核心的导出名会污染脚本作用域 | 它导出 `mount` / `normText` / `isDisplayed` 这类极通用的名字，bind 进脚本 IIFE 相当于跟脚本自己的变量抢同名（`function` 声明还会被 `var` 静默覆盖）。已改成不 bind，调用方一律走 `MW115Toolbar.xxx` |
+| 5 | 整理助手的入口一度被排到 IIFE 外 / 引用未初始化的 const | 入口要用 `showNamingModeDialog` 等在其后定义的常量。已挪到 IIFE 最末尾，并有测试钉住「必须在 MW115Toolbar 绑定之后、IIFE 内部」 |
+| 6 | **下拉菜单永远打不开**（冒烟测试抓到的最后一个） | `mount()` 里写的是 `if (opt.onClick)` 才绑 click 监听，但影片墙和整理助手的动作**全在菜单项里、按钮自身没有 `onClick`** —— 于是监听压根没绑，点主区毫无反应。判断依据已改成「有没有菜单」。这条只有真在浏览器里点一次才能发现，静态检查和 `node --check` 全都通过 |
+
+**测试**：`tests/toolbar.test.js` 共 20 条，分三层：
+
+1. **定位逻辑** —— 用手搓的极简假 DOM 跑（115 的真实页面在这儿搭不出来）。
+   其中一条专门锁住「顶栏文案常量」，115 一改文案就会在这里提醒你更新定位策略。
+2. **交互** —— 在假 DOM 上补齐了事件系统（`addEventListener` / `click` / `classList` / `insertBefore`），
+   **真的点一次主按钮**：验证开菜单 → 再点收起 → 点菜单项触发动作并自动收起；
+   以及重复挂载不会堆出两个 slot、挂不上时降级球确实接管。
+3. **接线回归** —— 入口、菜单项、绑定一根根钉死（少一根线就静默失效的地方）。
+
+另有 `tools/make-smoke.js` 生成 `tests/fixtures/toolbar-smoke.html`：把真实核心内联进一个
+「模拟 115 顶栏」的页面，用 Edge 无头跑一遍，验证真实浏览器里的挂载位置与点击行为
+（当前 8/8 项符合预期）。单测用假 DOM、冒烟用真浏览器，两层都过才算稳。
+
+---
+
 ## 115Master 补丁版 v1.13.0-sub7（2026-10-03）
 
 用户反馈「两个功能全部无效」。这版的目标就一件事：**把「静默无效」变成「屏幕上一定看得见」**。
@@ -126,11 +188,38 @@
 
 ```
 node tools/check.js             # 静态体检：语法 / @grant / @connect / 版本号是否记进本文
-node tools/build.js             # 把 src/core/115-core.js 内联进 scripts/*.user.js
+node tools/build.js             # 把 src/core/*.js 内联进 scripts/*.user.js
 node tools/build.js --check     # 只对比不同步、不改文件（提交前用）
-node --test tests/core.test.js  # 公共核心的单测
+node --test tests/*.test.js     # 单测（core 纯函数 + toolbar 定位/交互/接线回归）
+node tools/make-smoke.js        # 生成 tests/fixtures/toolbar-smoke.html（真实浏览器冒烟页）
 ```
 
-改完 `src/core/115-core.js` 必须跑一次 `node tools/build.js`；`--check` 会拦住忘记构建的情况。
+改完 `src/core/` 下任何一个核心都必须跑一次 `node tools/build.js`；`--check` 会拦住忘记构建的情况。
 交付出去的 `scripts/*.user.js` 是构建产物（保持「拖进 Tampermonkey 就能用」的单文件形态），
 所以它们要跟着一起提交。
+
+### 两个公共核心
+
+| 源码 | 标记区 | bind | 说明 |
+|---|---|---|---|
+| `src/core/115-core.js` | `MW115_CORE` | ✅ | 纯函数（转义 / 体积格式化 / pickcode 提取） |
+| `src/core/115-toolbar.js` | `MW115_TOOLBAR` | ❌ | 顶部工具栏挂载器。**故意不 bind**：它导出的 `mount`/`normText`/`isDisplayed` 太通用，bind 进脚本作用域会跟脚本自己的变量抢同名 |
+
+增删核心：在 `tools/build.js` 的 `CORES` 里加一条 `{ file, bind }`，脚本侧摆一对同名标记即可。
+
+⚠️ 脚本里用到某个核心的代码，**必须排在对应标记区之后**（都在同一个 IIFE 里）。
+`MW115Toolbar` 是 `var` 出来的，顺序反了这里就拿到 `undefined`，
+入口不出现而且不报错 —— `tests/toolbar.test.js` 里有一条测试专门钉这个。
+
+### 顶栏定位为什么这么写
+
+115 换过太多次版，class 不可靠。这套策略的优先级：
+
+1. **`title` 文案反查**（主路径）——「更多操作」「列表视图」是产品文案，比 class 稳
+2. **class 选择器候选** —— 覆盖历史几版结构
+3. **文本锚点上溯** —— 找到「上传/解压/全选」这类原生按钮，往上找到装着 ≥2 个锚点的那一层
+4. **同源 iframe** —— 旧版 115 的文件区在 `iframe[rel=wangpan]` 里
+5. **全失败 → 退回悬浮球** —— 宁可位置丑，不能没入口
+
+115 同时存在桌面版 / 移动版两套顶栏 DOM（只 `display:none` 掉一套），
+所以每一路候选都要过 `isDisplayed`，否则会插进看不见的那一套。
