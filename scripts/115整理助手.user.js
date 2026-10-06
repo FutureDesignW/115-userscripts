@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115整理助手 (115Rename2026 + 递归整理)
 // @namespace       https://github.com/liuchanghuaX1/115Rename2026
-// @version         2.9.2
+// @version         2.9.3
 // @description     在 115Rename2026 基础上整合「递归整理」：递归扫描当前目录及全部子目录 → 去掉文件名里的干扰词 → 抽取番号 → 视频汇总到当前目录 → 按所选「重命名方式」改名（本地优先，缺信息的条目才联网） → 清空已空的子目录。重命名方式 7 种可选，并支持**在整理预览面板里就地自定义模板**（`{code}{title}{actress}{date}{rating}{markers}` 变量按钮、实时重算、不联网）。改名后可在菜单里**一键撤销上次改名**。
 // @author          sonarlee (原始引擎) + 递归整理整合
 // @include         https://115.com/*
@@ -2497,7 +2497,9 @@
     cleanupExistingRootInfo();
 
     const uiStyle = `<style>
-        [id^="archive-root-info"] { position: fixed; top: 20px; right: 20px; max-width: 300px; background: rgba(0,0,0,.8); color: #fff; padding: 12px 20px; border-radius: 4px; z-index: 9998; font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,.15); border-left: 4px solid #1890ff; }
+        [id^="archive-root-info"] { position: fixed; top: 20px; right: 20px; max-width: 300px; background: rgba(0,0,0,.8); color: #fff; padding: 12px 20px; border-radius: 4px; z-index: 9998; font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,.15); border-left: 4px solid #1890ff; animation: archiveRootFade 8s ease forwards; }
+        /* 状态条 8s 后自己淡出。即便将来有别处再调它，也不会长期占着屏幕右上角。 */
+        @keyframes archiveRootFade { 0%, 70% { opacity: 1; } 100% { opacity: 0; visibility: hidden; } }
         .custom-notification { position: fixed; top: 80px; right: 20px; max-width: 300px; background: rgba(0,0,0,.8); color: #fff; padding: 12px 20px; border-radius: 4px; z-index: 9999; font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,.15); transition: all .3s ease; opacity: 0; transform: translateY(-10px); }
         .custom-notification.success { border-left: 4px solid #52c41a; }
         .custom-notification.error { border-left: 4px solid #f5222d; }
@@ -2518,14 +2520,19 @@
 
     const showArchiveRootInfo = () => {
         cleanupExistingRootInfo();
-        let msg = (archiveRootCid && archiveRootName) ? `当前归档根目录: "${archiveRootName}"` : "当前无归档根目录，将使用115网盘根目录";
-        if (window.self === window.top) $('body').append(`<div id="${rootInfoId}" class="archive-root-info">${msg}</div>`);
+        // ⚠️ 没设过归档根目录时不弹。
+        //    「当前无归档根目录，将使用115网盘根目录」是默认状态，不是需要提醒的事 ——
+        //    早先每次页面加载 2s 后就挂一条永久不消失的黑条在屏幕右上角，
+        //    用户实机反馈「一直有这个悬浮提示显示」。真设过才值得说一声。
+        if (!(archiveRootCid && archiveRootName)) return;
+        if (window.self === window.top) $('body').append(`<div id="${rootInfoId}" class="archive-root-info">当前归档根目录: "${archiveRootName}"</div>`);
     };
 
     let rootInfoTimer = null;
     const initializeRootInfo = () => {
         if (window.self !== window.top) return;
         if (rootInfoTimer) clearTimeout(rootInfoTimer);
+        // 状态条自动撤掉，不长期占屏（设置成功时另有 toast 提示）
         rootInfoTimer = setTimeout(() => { showArchiveRootInfo(); rootInfoTimer = null; }, 2000);
     };
     $(window).on('load', initializeRootInfo);
@@ -4108,7 +4115,8 @@
         if (cid) {
             GM_setValue("archiveRootCid", cid); GM_setValue("archiveRootName", name);
             archiveRootCid = cid; archiveRootName = name;
-            cleanupExistingRootInfo(); showArchiveRootInfo();
+            // 只用 toast 告知，不再挂常驻状态条（那个条每次刷新都出现，用户嫌烦）
+            cleanupExistingRootInfo();
             showPageNotification(`归档根目录设置成功: "${name}"`, 'success', 5000);
         }
     }
@@ -4129,7 +4137,7 @@
         };
     } catch (e) { /* ignore */ }
 
-    console.log('115整理助手 v2.9.2 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
+    console.log('115整理助手 v2.9.3 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
     /* ===== 入口：挂到 115 顶部工具栏（找不到才退回右下角悬浮球） =====
        工具栏下拉里的 13 项与右键菜单（第 22 节 rename_list）一一对应 ——
        两处共用同一批函数，右键菜单保留不动，当作工具栏挂不上时的第二条路。

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115影片墙
 // @namespace       cloud115.moviewall
-// @version         3.16.2
+// @version         3.16.3
 // @description     115 网盘影片墙（Emby 式）：直接读视频同目录下的海报/NFO（由本机 115 Media Hub 的「导出媒体文件」生成）；**素材实时存到本地**——NFO 原文/解析结果/海报原图自动落盘，缓存位置可选「浏览器本地」或「你自选的本机文件夹」（写成磁盘真实文件，可备份可复用），重开零请求秒出；卡片显示文件大小与码率；**新增「详情」面板**——剧情简介/标签/原名/厂牌/发行/系列/导演/时长/分级/国家/评分/数据来源 + 文件信息一屏看全（对齐 hub 的详情抽屉），卡片一行放不下的都在这里；排序支持 番号/文件名/目录/演员/类型/评分/观看日期/随机；**视图可切「海报墙 ⇄ 紧凑列表」**（列表一行一部，左侧小缩略图 + 右侧番号/标题/目录，扫番号更快，选择会记住）；勾选卡片可批量移动/删除并连带海报与 NFO，**做完原地摘卡片——不刷新页面、图不重下、滚动不跳**；**横版卡片默认用「横版高清」（-thumb/-fanart 里挑体积最大的那张：实测中位 776KB，是竖海报的 2.9 倍），可在设置里改成竖版海报或剧照；海报只有 147×200 时（约占 24%）会自动跳过糊图改用清晰图**
 // @author          cloud115.moviewall
 // @license         MIT
@@ -1128,6 +1128,14 @@
         return ok;
     }
 
+    /**
+     * 当前所在目录的 cid。
+     * ⚠️ 拿不到时返回 null（**不再静默回退 '0'**）——
+     *    搜索结果页（?q=xxx）、接收页等场景 URL 里根本没有 cid，
+     *    早先一律当根目录处理，于是墙里显示的是根目录内容、
+     *    而用户眼前是搜索结果 —— 观感就是「脚本失效了」，且毫无线索。
+     *    调用方必须显式处理 null（loadDirMode 会给出可照做的提示）。
+     */
     function currentCid() {
         try {
             const cid = new URLSearchParams(location.search).get('cid');
@@ -1140,7 +1148,14 @@
                 if (m) return m[1];
             }
         } catch (e) { /* ignore */ }
-        return '0';
+        return null;
+    }
+
+    /** 拿不到 cid 时给用户一句能照做的提示（别让他对着空墙猜）。 */
+    function noCidHint() {
+        const q = (function () { try { return new URLSearchParams(location.search).get('q'); } catch (e) { return null; } })();
+        if (q) return '当前是搜索结果页，没有「所在目录」可读。影片墙要进具体文件夹再用 —— 点搜索框左边任意一层目录即可。';
+        return '读不到当前目录（URL 里没有 cid）。请在 115 文件列表页打开影片墙；若是搜索页/接收页，请先点进任意一个文件夹。';
     }
 
     async function listDirAll(cid) {
@@ -4711,6 +4726,18 @@
        115 偶尔还要几秒），来回切两次就明显卡。现在先用缓存铺墙，再后台校验。 */
     async function loadDirMode(force) {
         const cid = currentCid();
+        // ⚠️ cid 拿不到就别硬扫 —— 早先 currentCid() 拿不到会静默返回 '0'（网盘根目录），
+        // 于是搜索结果页上打开影片墙会去扫整个根目录：墙里是根目录内容、
+        // 用户眼前是搜索结果，观感就是「抓不到内容 / 脚本失效」，且毫无线索。
+        if (!cid) {
+            state.curCid = null;
+            state.items = [];
+            const grid = $('#mw-grid');
+            if (grid) grid.innerHTML = `<div class="mw-empty">${noCidHint()}</div>`;
+            setBusy(false);
+            toast(noCidHint(), 'error', 6000);
+            return;
+        }
         state.curCid = cid;
         const key = STORE_DIR + cid;
         const cached = (force || !CFG.localFirst) ? null : loadJson(key, null);
@@ -4762,7 +4789,18 @@
        这才是「重开影片墙要等很久」的主因。现在不管索引多旧都先拿来铺墙，再在后台悄悄校验。 */
     async function loadLibMode(force) {
         const root = state.rootCid || currentCid();
-        if (!root) { toast('未设置库根目录', 'error', 3000); return; }
+        // 拿不到根目录时要说清是「当前页面没有目录上下文」还是「压根没设过库根目录」——
+        // 两者都能让 root 为空，但用户该做的事完全不同。
+        if (!root) {
+            state.items = [];
+            const grid = $('#mw-grid');
+            const msg = currentCid() ? '未设置库根目录：在工具栏「影片墙 → 把当前目录设为影片库根目录」设一次，之后全库模式就有范围了。'
+                : noCidHint();
+            if (grid) grid.innerHTML = `<div class="mw-empty">${msg}</div>`;
+            setBusy(false);
+            toast(msg, 'error', 6000);
+            return;
+        }
         state.rootCid = root;
         const key = STORE_LIB + root;
         const cached = (force || !CFG.localFirst) ? null : loadJson(key, null);
@@ -5985,6 +6023,9 @@
                 else if (act === 'delete-sel') await runBatchOps('delete');
                 else if (act === 'setroot') {
                     const cid = currentCid();
+                    // 拿不到 cid 就别写 —— 把 null 存进 GM，下次读出来还是 null，
+                    // 全库模式就永远起不来，而且现场早就没了（最难查的那种坏法）
+                    if (!cid) { toast(noCidHint(), 'error', 5000); return; }
                     state.rootCid = cid;
                     GM_setValue(STORE_ROOT, cid);
                     GM_setValue(STORE_ROOT_NAME, '');
@@ -6065,6 +6106,7 @@
                     {
                         label: '把当前目录设为影片库根目录', onClick: () => {
                             const cid = currentCid();
+                            if (!cid) { toast(noCidHint(), 'error', 5000); return; }
                             state.rootCid = cid;
                             GM_setValue(STORE_ROOT, cid);
                             toast('已把当前目录设为影片库根目录 (cid=' + cid + ')', 'success', 3000);
@@ -6091,6 +6133,7 @@
         GM_registerMenuCommand('影片墙设置', buildSettingsPanel);
         GM_registerMenuCommand('把当前目录设为影片库根目录', () => {
             const cid = currentCid();
+            if (!cid) { toast(noCidHint(), 'error', 5000); return; }
             state.rootCid = cid;
             GM_setValue(STORE_ROOT, cid);
             toast('已把当前目录设为影片库根目录 (cid=' + cid + ')', 'success', 3000);
@@ -6160,7 +6203,44 @@
             state, getCache: () => posterCache, setCache: (o) => { posterCache = o; },
             getTrans: () => transCache, CFG_DEF,
             getCfg: () => CFG, setCfg: (o) => { CFG = Object.assign(CFG, o); },
-            saveCfg: saveCfg
+            saveCfg: saveCfg,
+            noCidHint, currentCid,
+            /**
+             * 布局自检：覆盖层「说」要铺满视口，实际铺了多少？被谁挡住？
+             * Console 里跑 __mw.diagLayout() —— 打印一张表，不用猜。
+             */
+            diagLayout: () => {
+                const ov = $('#mw-overlay');
+                if (!ov) return { 覆盖层: '未打开（先点开影片墙）' };
+                const r = ov.getBoundingClientRect();
+                const cs = getComputedStyle(ov);
+                const win = { w: innerWidth, h: innerHeight };
+                // 谁盖在覆盖层上面？逐个命中点测试
+                const blockers = [];
+                [[win.w / 2, win.h / 2], [10, 10], [win.w - 10, win.h - 10]].forEach(([x, y]) => {
+                    const el = document.elementFromPoint(x, y);
+                    if (el && el !== ov && !ov.contains(el)) {
+                        blockers.push({
+                            坐标: Math.round(x) + ',' + Math.round(y),
+                            元素: el.tagName + (el.id ? '#' + el.id : '') +
+                                (el.className && typeof el.className === 'string' ? '.' + el.className.split(' ').slice(0, 3).join('.') : ''),
+                            在覆盖层内: ov.contains(el)
+                        });
+                    }
+                });
+                return {
+                    视口: win.w + '×' + win.h,
+                    覆盖层实际: Math.round(r.width) + '×' + Math.round(r.height) + ' @ ' + Math.round(r.left) + ',' + Math.round(r.top),
+                    铺满视口: Math.round(r.width) === win.w && Math.round(r.height) === win.h,
+                    position: cs.position, zIndex: cs.zIndex, display: cs.display,
+                    父节点: ov.parentElement ? (ov.parentElement.tagName + (ov.parentElement.id ? '#' + ov.parentElement.id : '')) : '(无)',
+                    挂在body下: ov.parentElement === document.body,
+                    挡住它的元素: blockers,
+                    当前cid: currentCid(),
+                    影片数: (state.items || []).length,
+                    提示: (!currentCid() ? noCidHint() : '')
+                };
+            }
         };
     } catch (e) {
         console.error('[115影片墙] 调试出口挂载失败（不影响主功能）:', e && e.message);

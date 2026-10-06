@@ -779,6 +779,55 @@ test('影片墙：菜单项跟 GM_registerMenuCommand 一一对应', () => {
   assert.ok(/caret: true/.test(src), '影片墙按钮缺 caret（有下拉时主区只开菜单）');
 });
 
+test('影片墙：拿不到 cid 时不再静默当网盘根目录（搜索页「抓不到内容」的根因）', () => {
+  const src = readScript('115影片墙.user.js');
+  // currentCid 末尾必须是 return null，不能是 return '0'
+  const fn = src.slice(src.indexOf('function currentCid()'));
+  const body = fn.slice(0, fn.indexOf('\n    }'));
+  assert.ok(/return null;/.test(body),
+    'currentCid() 拿不到 cid 时应返回 null —— 早先返回 \'0\'（网盘根目录），' +
+    '于是搜索结果页上打开影片墙会去扫整个根目录，墙里内容跟用户眼前的搜索结果完全对不上');
+  assert.ok(!/return '0';/.test(body), "不该再回退 '0'");
+
+  // 三处「设为库根目录」都要挡 null —— 把 null 存进 GM，下次读出来还是 null，
+  // 全库模式永远起不来，而现场早就没了
+  const setroots = src.match(/const cid = currentCid\(\);/g) || [];
+  assert.ok(setroots.length >= 3, '三处设根目录入口都该出现，实际 ' + setroots.length);
+  const guards = src.match(/if \(!cid\) \{ toast\(noCidHint\(\), 'error'/g) || [];
+  assert.ok(guards.length >= 3,
+    '三处设根目录都要有 null 保护，实际 ' + guards.length + ' —— 漏一处就可能把 null 写进 GM');
+
+  // 目录/全库两个模式的入口都要给出可照做的提示
+  assert.ok(src.includes('noCidHint()'), '缺 noCidHint');
+  assert.ok(/function noCidHint\(\)/.test(src));
+  assert.ok(src.includes('loadDirMode'), 'loadDirMode 应处理 cid 为空');
+});
+
+test('影片墙：有布局自检入口（覆盖层铺不满时能直接查，不用猜）', () => {
+  const src = readScript('115影片墙.user.js');
+  assert.ok(/diagLayout/.test(src), '缺 diagLayout 调试出口');
+  // 覆盖层必须固定挂在 body 下 —— 挂到别处会被 115 的层叠上下文限制
+  assert.ok(/document\.body\.appendChild\(ov\)/.test(src), '覆盖层应挂在 document.body 下');
+  assert.ok(/#mw-overlay\{position:fixed;inset:0/.test(src), '覆盖层应 fixed + inset:0 铺满视口');
+});
+
+test('整理助手：没设归档根目录时不弹常驻状态条（用户实机反馈「一直有悬浮提示」）', () => {
+  const src = readScript('115整理助手.user.js');
+  const fn = src.slice(src.indexOf('const showArchiveRootInfo'));
+  const body = fn.slice(0, fn.indexOf('let rootInfoTimer'));
+  assert.ok(/if \(!\(archiveRootCid && archiveRootName\)\) return;/.test(body),
+    '没设归档根目录时应直接 return —— 那是默认状态，不值得占着屏幕右上角');
+  // 文案本身不能出现在代码体里（注释里可以，那是解释为什么删）
+  const codeOnly = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  assert.ok(!/当前无归档根目录/.test(codeOnly),
+    '不该再弹「当前无归档根目录」这条提示（用户实机反馈它一直挂在页面上）');
+  // 设根目录成功时改用 toast，不再挂常驻条
+  assert.ok(!/cleanupExistingRootInfo\(\); showArchiveRootInfo\(\);/.test(src),
+    '设根目录后不该再挂常驻状态条');
+  // 兜底：状态条 8s 后自动淡出
+  assert.ok(/@keyframes archiveRootFade/.test(src), '状态条应加自动淡出动画');
+});
+
 test('整理助手：13 项动作都进了工具栏下拉', () => {
   const src = readScript('115整理助手.user.js');
   const labels = [
