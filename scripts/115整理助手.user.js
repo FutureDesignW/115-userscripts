@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115整理助手 (115Rename2026 + 递归整理)
 // @namespace       https://github.com/liuchanghuaX1/115Rename2026
-// @version         2.9.1
+// @version         2.9.2
 // @description     在 115Rename2026 基础上整合「递归整理」：递归扫描当前目录及全部子目录 → 去掉文件名里的干扰词 → 抽取番号 → 视频汇总到当前目录 → 按所选「重命名方式」改名（本地优先，缺信息的条目才联网） → 清空已空的子目录。重命名方式 7 种可选，并支持**在整理预览面板里就地自定义模板**（`{code}{title}{actress}{date}{rating}{markers}` 变量按钮、实时重算、不联网）。改名后可在菜单里**一键撤销上次改名**。
 // @author          sonarlee (原始引擎) + 递归整理整合
 // @include         https://115.com/*
@@ -3369,6 +3369,40 @@
            匹配前先做归一（去空白），所以「上 传」这种排版也认。 */
         var ANCHOR_TEXTS = ['上传', '解压', '新建', '排序', '筛选', '粘贴', '复制路径', '复制链接', '全选', '批量'];
 
+        /* ---- ③ 路由门禁：不是文件列表页就别挂入口 ----------------------------
+           115 的脚本 @include 是 https://115.com/*，播放页 / 接收页 / 登录页全都命中，
+           但那些页面上：① 没有文件列表，影片墙和整理助手本来就用不上；
+           ② 也没有那个顶栏（定位必然失败）；③ 于是降级球会孤零零挂在播放页上，
+           挡住播放器控制条 —— 用户实机反馈「在播放页面还是显示悬浮按钮」。
+
+           115 的路由两种形态都要防：新版是 hash 路由（`#/video/xxx`），
+           老版是路径路由（`/video/xxx`）。所以这里对 href 做整体子串匹配，
+           「#/video」和「/video」两种前缀都列进黑名单。
+
+           用**黑名单**而不是白名单：115 路由名会变，白名单一改版就又冒出来了。
+           拿不到 href 时保守放行 —— 宁可多挂一次，也不要把入口误杀。 */
+        var NON_LIST_ROUTES = [
+            '/video',        // 播放页（新版 #/video/xxx 与老版 /video/xxx 都覆盖）
+            '/receive',      // 接收页
+            '/login',        // 登录
+            '/passport',
+            '/desktop'       // 桌面/我的页面，无文件列表上下文
+        ];
+
+        /** 当前是否适合挂工具栏入口。不适合时返回 false，调用方应完全不挂（连降级球都别出）。 */
+        function isListPage(loc) {
+            var href = '';
+            try {
+                var l = loc || (typeof window !== 'undefined' ? window.location : null);
+                href = (l && (l.href || l.toString())) || '';
+            } catch (e) { return true; }   // 拿不到就当可以，别把入口误杀
+            if (!href) return true;
+            for (var i = 0; i < NON_LIST_ROUTES.length; i++) {
+                if (href.indexOf(NON_LIST_ROUTES[i]) >= 0) return false;
+            }
+            return true;
+        }
+
         /** 文本归一：去所有空白 + 转字符串（115 的按钮里常带 <svg>，textContent 里会混进空白）。 */
         function normText(s) {
             return String(s == null ? '' : s).replace(/\s+/g, '');
@@ -3524,6 +3558,37 @@
                 if (inner && visit(inner)) return true;
             }
             return false;
+        }
+
+        /**
+         * 只清降级球（slot 保持不动）。
+         * 球有各自的 id（影片墙 #mw-fab、整理助手 #av-organize-fab），核心不猜 ——
+         * 由调用方通过 opts.fallbackId 声明，另有 opts.legacyFallbackIds 收旧版遗留。
+         * ⚠️ 核心绝不能擅自覆写 fb.id：那会废掉脚本里
+         *    `if ($('#mw-fab')) return $('#mw-fab')[0]` 的幂等短路，
+         *    每次巡逻都新建一个球，页面上就堆出一排「多了一条」。
+         */
+        function clearFallbacks(opts) {
+            if (!opts) return;
+            var ids = (opts.legacyFallbackIds || []).slice();
+            if (opts.fallbackId) ids.unshift(opts.fallbackId);
+            for (var i = 0; i < ids.length; i++) {
+                var n = document.getElementById(ids[i]);
+                while (n) {
+                    var parent = n.parentNode;
+                    if (!parent) break;
+                    parent.removeChild(n);
+                    n = document.getElementById(ids[i]);   // 同一 id 可能有多个节点
+                }
+            }
+        }
+
+        /** 连工具栏 slot 一起撤 —— 切到播放页时用。 */
+        function clearEntry(opts) {
+            if (!opts) return;
+            var slot = document.getElementById(opts.id);
+            if (slot && slot.parentNode) slot.parentNode.removeChild(slot);
+            clearFallbacks(opts);
         }
 
         /* ------------------------------------------------------------------------
@@ -3713,6 +3778,17 @@
          * 返回 { el, inToolbar: Boolean }
          */
         function mountOrFallback(opts) {
+            // 播放页 / 接收页等没有文件列表的路由：既挂不上工具栏，功能也用不上，
+            // 出降级球只会挡住播放器控制条。
+            // ⚠️ 但巡逻必须照常启动 —— 115 是 SPA，用户在播放页和列表页之间切不会
+            //    重载页面，脚本在这两种路由间「出生」的话，只有巡逻能把入口补回来。
+            var listPage = isListPage();
+            if (!listPage) {
+                clearEntry(opts);
+                startWatch(opts);
+                return { el: null, inToolbar: false, skipped: 'not-list-page' };
+            }
+
             ensureStyle(document);
             var el = mount(opts);
             if (el) {
@@ -3748,6 +3824,7 @@
 
         /**
          * 巡逻：115 是 SPA，切目录/改视图会把顶栏整块重建，节点被冲掉后自动补挂。
+         * 同时兼管路由切换：去播放页撤掉入口，回列表页补上。
          *
          * 判定「被冲掉了」的方式不是比对选择器（那些 class 每次构建都在变），
          * 而是重新定位一次工具栏、看 slot 还在不在那个 host 底下 —— 与 mount() 同一条判定逻辑。
@@ -3757,39 +3834,21 @@
             if (!opts || opts._watching) return;
             opts._watching = true;
 
-            /**
-             * 清掉降级球。
-             * 球有各自的 id（影片墙 #mw-fab、整理助手 #av-organize-fab），核心不猜 ——
-             * 由调用方通过 opts.fallbackId 声明，另有 opts.legacyFallbackIds 收旧版遗留。
-             * ⚠️ 核心绝不能擅自覆写 fb.id：那会废掉脚本里
-             *    `if ($('#mw-fab')) return $('#mw-fab')[0]` 的幂等短路，
-             *    每次巡逻都新建一个球，页面上就堆出一排「多了一条」。
-             */
-            function clearFallbacks() {
-                var ids = (opts.legacyFallbackIds || []).slice();
-                if (opts.fallbackId) ids.unshift(opts.fallbackId);
-                for (var i = 0; i < ids.length; i++) {
-                    var n = document.getElementById(ids[i]);
-                    while (n) {
-                        var parent = n.parentNode;
-                        if (!parent) break;
-                        parent.removeChild(n);
-                        n = document.getElementById(ids[i]);   // 同一 id 可能有多个节点
-                    }
-                }
-            }
-
             setInterval(function () {
+                // 115 是 SPA：在列表页和播放页之间切不会重载页面。
+                // 切到播放页就把入口撤掉（不然挡住播放器控制条），切回来再补上。
+                if (!isListPage()) {
+                    clearEntry(opts);
+                    return;
+                }
+
                 var slot = document.getElementById(opts.id);
                 var hit = findToolbar(document);
                 var alive = slot && hit && slot.parentElement === hit.host;
 
                 if (!alive) {
-                    // 还挂在 body 上（降级态）就先撤掉，避免和工具栏按钮同时在场
-                    if (slot && slot.parentElement === document.body && slot.parentNode) {
-                        slot.parentNode.removeChild(slot);
-                    }
-                    clearFallbacks();
+                    // slot 不在位（被 SPA 冲掉了 / 还挂在 body 上降级态）—— 全撤掉重来
+                    clearEntry(opts);
 
                     // 核心不设 id：让脚本自己的 buildFallbackFab 走幂等短路，
                     // 它复用的旧节点会带着正确的 id 回到页面上。
@@ -3798,8 +3857,8 @@
                         if (fb) document.body.appendChild(fb);
                     }
                 } else {
-                    // 已经在工具栏上了 —— 把还残留的降级球清干净
-                    clearFallbacks();
+                    // 已在工具栏上（slot 要留着）—— 只清可能残留的降级球
+                    clearFallbacks(opts);
                 }
             }, 1500);
         }
@@ -3810,9 +3869,11 @@
             findToolbar: findToolbar,
             locateByTitle: locateByTitle,
             isDisplayed: isDisplayed,
+            isListPage: isListPage,
             normText: normText,
             ANCHOR_TEXTS: ANCHOR_TEXTS,
             SELECTORS: SELECTORS,
+            NON_LIST_ROUTES: NON_LIST_ROUTES,
             TITLE_MORE: TITLE_MORE,
             TITLE_LIST_VIEW: TITLE_LIST_VIEW,
             NEW_HEADER_CLASS: NEW_HEADER_CLASS,
@@ -4068,7 +4129,7 @@
         };
     } catch (e) { /* ignore */ }
 
-    console.log('115整理助手 v2.9.1 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
+    console.log('115整理助手 v2.9.2 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
     /* ===== 入口：挂到 115 顶部工具栏（找不到才退回右下角悬浮球） =====
        工具栏下拉里的 13 项与右键菜单（第 22 节 rename_list）一一对应 ——
        两处共用同一批函数，右键菜单保留不动，当作工具栏挂不上时的第二条路。

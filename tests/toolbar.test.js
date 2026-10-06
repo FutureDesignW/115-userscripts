@@ -297,7 +297,9 @@ function installGlobals(api) {
     getComputedStyle: null,
     addEventListener() {}, removeEventListener() {},
     setTimeout: () => 0, clearTimeout() {},
-    requestAnimationFrame: (fn) => { fn(); return 0; }
+    requestAnimationFrame: (fn) => { fn(); return 0; },
+    // 默认列表页；测试要测播放页就改 restore.window.location.href
+    location: { href: 'https://115.com/#/' }
   };
   const intervalFns = [];
   global.window = fakeWin;
@@ -312,6 +314,8 @@ function installGlobals(api) {
     global.window = saved.window;
     global.setInterval = saved.setInterval;
   };
+  restore.window = fakeWin;          // 测试要改 location 就走 restore.window.location.href
+  restore.doc = api;
   restore.tick = (n) => {
     for (let i = 0; i < (n || intervalFns.length); i++) {
       intervalFns.forEach((x) => { try { x.fn(); } catch (e) { /* 单次巡逻出错不该中断测试 */ } });
@@ -569,8 +573,7 @@ test('回归：降级球和工具栏按钮不得同时在场（用户实机报�
   }
 });
 
-test('回归：历史遗留的旧 id 降级球也会被清掉', () => {
-  const doc = makeDoc(NEW_HEADER_HTML);
+test('回归：历史遗留的旧 id 降级球也会被清掉', () => {  const doc = makeDoc(NEW_HEADER_HTML);
   const restore = installGlobals(doc);
   try {
     // 升级前就在页面上的旧球（id 是上一版核心生成的）
@@ -590,10 +593,108 @@ test('回归：历史遗留的旧 id 降级球也会被清掉', () => {
         return d;
       }
     });
+    // 连跑两轮：第一轮挂上工具栏按钮（顺带清掉旧球），第二轮验证
+    // 「已在工具栏上」这条分支也真的会清球 —— 早先这里漏传了 opts，
+    // clearFallbacks(undefined) 清的是空列表，残留球永远清不掉。
     restore.intervals.forEach((x) => { try { x.fn(); } catch (e) { /* ignore */ } });
-
     assert.ok(doc.getElementById('tb-legacy'), '工具栏按钮应挂上');
     assert.strictEqual(doc.getElementById('tb-legacy-fallback'), null, '旧 id 的残留球要清掉');
+
+    // 再塞一个残留球，只触发「已挂上工具栏」这一条分支
+    const again = doc.createElement('div');
+    again.id = 'tb-legacy-fab';
+    again.className = 'mw115-tb-fallback';
+    doc.body.appendChild(again);
+    assert.ok(doc.getElementById('tb-legacy-fab'), '前置条件：新残留球已插入');
+    restore.intervals.forEach((x) => { try { x.fn(); } catch (e) { /* ignore */ } });
+    assert.strictEqual(doc.getElementById('tb-legacy-fab'), null,
+      '已在工具栏上时也要清降级球（这条分支曾漏传 opts，等于没清）');
+    assert.ok(doc.getElementById('tb-legacy'), '清球不能把工具栏 slot 一起清掉');
+  } finally {
+    restore();
+  }
+});
+
+/* ===========================================================================
+ * ② 之二：路由门禁 —— 播放页不该有入口（用户实机报「播放页面还是显示悬浮按钮」）
+ * ======================================================================== */
+
+test('isListPage：播放页/接收页返回 false，列表页返回 true', () => {
+  const L = (href) => toolbar.isListPage({ href });
+  // 文件列表（115 的 hash 路由，列表页就是根或 /index）
+  assert.strictEqual(L('https://115.com/'), true, '根路径是列表页');
+  assert.strictEqual(L('https://115.com/#/'), true);
+  assert.strictEqual(L('https://115.com/#/index'), true);
+  // 播放页
+  assert.strictEqual(L('https://115.com/#/video'), false, '播放页不该挂入口');
+  assert.strictEqual(L('https://115.com/#/video/abc123'), false);
+  assert.strictEqual(L('https://115.com/video/abc123'), false, '老版播放页路径');
+  // 其它无文件列表的页面
+  assert.strictEqual(L('https://115.com/#/receive'), false);
+  assert.strictEqual(L('https://115.com/#/login'), false);
+  // 拿不到 href 时保守放行，别把入口误杀
+  assert.strictEqual(toolbar.isListPage(null), true, '拿不到 location 时应放行');
+  assert.strictEqual(toolbar.isListPage({}), true);
+});
+
+test('回归：出生在播放页时不挂任何入口，连降级球都不出（用户实机反馈）', () => {
+  const doc = makeDoc('<body><div class="player">播放器</div></body>');
+  const restore = installGlobals(doc);
+  restore.window.location.href = 'https://115.com/#/video/abc123';
+  try {
+    let fbBuilt = 0;
+    const res = toolbar.mountOrFallback({
+      id: 'tb-video',
+      fallbackId: 'tb-video-fab',
+      buttons: [{ label: '影片墙', onClick() {} }],
+      fallback: function () {
+        fbBuilt++;
+        const d = doc.createElement('div');
+        d.id = 'tb-video-fab';
+        d.className = 'mw115-tb-fallback';
+        return d;
+      }
+    });
+    assert.strictEqual(res.skipped, 'not-list-page', '播放页应被跳过');
+    assert.strictEqual(res.el, null, '不该返回入口元素');
+    assert.strictEqual(fbBuilt, 0, '播放页不该造降级球');
+    assert.strictEqual(doc.getElementById('tb-video'), null, '不该有工具栏 slot');
+    assert.strictEqual(doc.getElementById('tb-video-fab'), null,
+      '播放页不该出现悬浮球 —— 它会挡住播放器控制条');
+  } finally {
+    restore();
+  }
+});
+
+test('回归：SPA 在播放页↔列表页之间切，入口跟着撤/补', () => {
+  // 115 切路由不重载页面。出生在列表页，切到播放页要撤，切回来要补。
+  const doc = makeDoc(NEW_HEADER_HTML);
+  const restore = installGlobals(doc);
+  const loc = restore.window.location;
+  loc.href = 'https://115.com/#/';
+  try {
+    const opts = {
+      id: 'tb-spa',
+      fallbackId: 'tb-spa-fab',
+      buttons: [{ label: '影片墙', onClick() {} }],
+      fallback: function () {
+        const d = doc.createElement('div');
+        d.id = 'tb-spa-fab';
+        return d;
+      }
+    };
+    toolbar.mountOrFallback(opts);
+    assert.ok(doc.getElementById('tb-spa'), '列表页应挂上入口');
+
+    // 切到播放页
+    loc.href = 'https://115.com/#/video/abc';
+    restore.intervals.forEach((x) => { try { x.fn(); } catch (e) { /* ignore */ } });
+    assert.strictEqual(doc.getElementById('tb-spa'), null, '切到播放页应撤掉入口');
+
+    // 切回列表页
+    loc.href = 'https://115.com/#/';
+    restore.intervals.forEach((x) => { try { x.fn(); } catch (e) { /* ignore */ } });
+    assert.ok(doc.getElementById('tb-spa'), '切回列表页应补上入口');
   } finally {
     restore();
   }
