@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115影片墙
 // @namespace       cloud115.moviewall
-// @version         3.16.0
+// @version         3.16.1
 // @description     115 网盘影片墙（Emby 式）：直接读视频同目录下的海报/NFO（由本机 115 Media Hub 的「导出媒体文件」生成）；**素材实时存到本地**——NFO 原文/解析结果/海报原图自动落盘，缓存位置可选「浏览器本地」或「你自选的本机文件夹」（写成磁盘真实文件，可备份可复用），重开零请求秒出；卡片显示文件大小与码率；**新增「详情」面板**——剧情简介/标签/原名/厂牌/发行/系列/导演/时长/分级/国家/评分/数据来源 + 文件信息一屏看全（对齐 hub 的详情抽屉），卡片一行放不下的都在这里；排序支持 番号/文件名/目录/演员/类型/评分/观看日期/随机；**视图可切「海报墙 ⇄ 紧凑列表」**（列表一行一部，左侧小缩略图 + 右侧番号/标题/目录，扫番号更快，选择会记住）；勾选卡片可批量移动/删除并连带海报与 NFO，**做完原地摘卡片——不刷新页面、图不重下、滚动不跳**；**横版卡片默认用「横版高清」（-thumb/-fanart 里挑体积最大的那张：实测中位 776KB，是竖海报的 2.9 倍），可在设置里改成竖版海报或剧照；海报只有 147×200 时（约占 24%）会自动跳过糊图改用清晰图**
 // @author          cloud115.moviewall
 // @license         MIT
@@ -651,12 +651,18 @@
         }
 
         function ensureStyle(doc) {
-            if (!doc || !doc.head) return;
-            if (doc.getElementById && doc.getElementById(STYLE_ID)) return;
-            var s = doc.createElement('style');
-            s.id = STYLE_ID;
-            s.textContent = css();
-            (doc.head || doc.documentElement).appendChild(s);
+            if (!doc) return;
+            // head 偶尔拿不到（文档还没建好），退到 documentElement，再不行就放弃 ——
+            // 但绝不能因此把整个挂载流程带崩，样式缺失只是难看，功能还在。
+            var host = doc.head || doc.documentElement || doc.body;
+            if (!host || typeof host.appendChild !== 'function') return;
+            try {
+                if (doc.getElementById && doc.getElementById(STYLE_ID)) return;
+                var s = doc.createElement('style');
+                s.id = STYLE_ID;
+                s.textContent = css();
+                host.appendChild(s);
+            } catch (e) { /* 样式注入失败不该影响入口可用性 */ }
         }
 
         /** 造一个工具栏按钮。opt = { label, dot, title, caret, menuTitle, items:[{label, onClick, sep}] } */
@@ -714,16 +720,27 @@
         /**
          * 把按钮挂到顶部工具栏。
          *   opts = {
-         *     id:     'mw115-tb-moviewall',   // slot 的 id（幂等键）
-         *     buttons:[{ label, dot, title, onClick, caret, menuTitle, items }]
+         *     id:       'mw-tb-moviewall',   // slot 的 id（幂等键）
+         *     buttons:  [{ label, dot, title, onClick, caret, menuTitle, items }]
+         *     fallback: () => 元素            // 挂不上时用的降级球
+         *     fallbackId: 'mw-fab'            // 降级球的 id，供巡逻清理
+         *     legacyFallbackIds: ['旧id']     // 历史版本遗留的降级球 id
          *   }
          * 返回 slot 元素；找不到工具栏返回 null（调用方自行降级到悬浮球）。
          */
         function mount(opts) {
             if (!opts || !opts.id) return null;
 
+            // ⚠️ 样式必须无条件注入，且要在定位之前 ——
+            //    定位失败会 return null，而降级球（.mw115-tb-fallback）用的
+            //    position:fixed 就来自这份 CSS。早先 ensureStyle 排在 return 之后，
+            //    于是挂不上工具栏时降级球是个裸 div：block 布局 + 通栏渐变背景，
+            //    直接横一条在页面底部，用户看到的就是「下面多了一条」。
+            ensureStyle(document);
+
             var host = null, before = null, doc = null;
             eachDocument(document, function (d) {
+                ensureStyle(d);   // iframe 内的顶栏也要有样式
                 var hit = findToolbar(d);
                 if (hit) { host = hit.host; before = hit.before; doc = d; return true; }
                 return false;
@@ -731,8 +748,6 @@
 
             // 找不到就返回 null —— 调用方负责回退到自己的悬浮入口。
             if (!host) return null;
-
-            ensureStyle(doc);
 
             var slot = doc.getElementById(opts.id);
             if (!slot || slot.parentElement !== host) {
@@ -782,13 +797,35 @@
          * 返回 { el, inToolbar: Boolean }
          */
         function mountOrFallback(opts) {
+            ensureStyle(document);
             var el = mount(opts);
             if (el) {
                 startWatch(opts);
                 return { el: el, inToolbar: true };
             }
             var fb = opts.fallback ? opts.fallback() : null;
-            if (fb && fb.parentNode !== document.body) document.body.appendChild(fb);
+            if (fb) {
+                // ⚠️ 不要改 fb.id —— id 是调用方的身份，靠它做幂等短路。
+                //    早先在这里覆写成 opts.id + '-fallback'，直接废掉了脚本里的
+                //    `if ($('#mw-fab')) return $('#mw-fab')[0]` ——
+                //    每次巡逻都新建一个球，页面上就堆出一排「多了一条」。
+                //    降级球的定位/尺寸用内联样式钉一遍：CSS 注入万一失败
+                //    （CSP 拦 style、head 拿不到），一个没约束的 div 会按 block
+                //    铺满整行，表现为「页面底部多了一条横条」。
+                if (fb.style) {
+                    fb.style.position = 'fixed';
+                    fb.style.right = '18px';
+                    fb.style.bottom = '88px';
+                    fb.style.zIndex = '9998';
+                    fb.style.display = 'inline-flex';
+                    fb.style.alignItems = 'center';
+                    fb.style.height = '36px';
+                    fb.style.padding = '0 14px';
+                    fb.style.borderRadius = '18px';
+                    fb.style.width = 'auto';
+                }
+                if (fb.parentNode !== document.body) document.body.appendChild(fb);
+            }
             startWatch(opts);
             return { el: fb, inToolbar: false };
         }
@@ -803,6 +840,29 @@
         function startWatch(opts) {
             if (!opts || opts._watching) return;
             opts._watching = true;
+
+            /**
+             * 清掉降级球。
+             * 球有各自的 id（影片墙 #mw-fab、整理助手 #av-organize-fab），核心不猜 ——
+             * 由调用方通过 opts.fallbackId 声明，另有 opts.legacyFallbackIds 收旧版遗留。
+             * ⚠️ 核心绝不能擅自覆写 fb.id：那会废掉脚本里
+             *    `if ($('#mw-fab')) return $('#mw-fab')[0]` 的幂等短路，
+             *    每次巡逻都新建一个球，页面上就堆出一排「多了一条」。
+             */
+            function clearFallbacks() {
+                var ids = (opts.legacyFallbackIds || []).slice();
+                if (opts.fallbackId) ids.unshift(opts.fallbackId);
+                for (var i = 0; i < ids.length; i++) {
+                    var n = document.getElementById(ids[i]);
+                    while (n) {
+                        var parent = n.parentNode;
+                        if (!parent) break;
+                        parent.removeChild(n);
+                        n = document.getElementById(ids[i]);   // 同一 id 可能有多个节点
+                    }
+                }
+            }
+
             setInterval(function () {
                 var slot = document.getElementById(opts.id);
                 var hit = findToolbar(document);
@@ -810,17 +870,20 @@
 
                 if (!alive) {
                     // 还挂在 body 上（降级态）就先撤掉，避免和工具栏按钮同时在场
-                    if (slot && slot.parentElement === document.body) slot.remove();
-                    var fbOld = document.getElementById(opts.id + '-fallback');
-                    if (fbOld) fbOld.remove();
+                    if (slot && slot.parentElement === document.body && slot.parentNode) {
+                        slot.parentNode.removeChild(slot);
+                    }
+                    clearFallbacks();
 
+                    // 核心不设 id：让脚本自己的 buildFallbackFab 走幂等短路，
+                    // 它复用的旧节点会带着正确的 id 回到页面上。
                     if (!mount(opts) && opts.fallback && document.body) {
                         var fb = opts.fallback();
-                        if (fb) {
-                            fb.id = opts.id + '-fallback';
-                            document.body.appendChild(fb);
-                        }
+                        if (fb) document.body.appendChild(fb);
                     }
+                } else {
+                    // 已经在工具栏上了 —— 把还残留的降级球清干净
+                    clearFallbacks();
                 }
             }, 1500);
         }
@@ -5924,6 +5987,11 @@
         if ($('#mw-tb-moviewall') || $('#mw-fab')) return;
         MW115Toolbar.mountOrFallback({
             id: 'mw-tb-moviewall',
+            // 降级球的 id 要告诉核心，巡逻才能在挂上工具栏后把它清掉。
+            // 少了这两行：页面加载初期顶栏还没渲染好 → 先出降级球，
+            // 1.5s 后巡逻挂上工具栏按钮，但球留着 —— 两者同时在场。
+            fallbackId: 'mw-fab',
+            legacyFallbackIds: ['mw-tb-moviewall-fallback'],
             buttons: [{
                 label: '影片墙',
                 dot: '#22d3ee',

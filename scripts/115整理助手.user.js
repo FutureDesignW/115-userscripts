@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115整理助手 (115Rename2026 + 递归整理)
 // @namespace       https://github.com/liuchanghuaX1/115Rename2026
-// @version         2.9.0
+// @version         2.9.1
 // @description     在 115Rename2026 基础上整合「递归整理」：递归扫描当前目录及全部子目录 → 去掉文件名里的干扰词 → 抽取番号 → 视频汇总到当前目录 → 按所选「重命名方式」改名（本地优先，缺信息的条目才联网） → 清空已空的子目录。重命名方式 7 种可选，并支持**在整理预览面板里就地自定义模板**（`{code}{title}{actress}{date}{rating}{markers}` 变量按钮、实时重算、不联网）。改名后可在菜单里**一键撤销上次改名**。
 // @author          sonarlee (原始引擎) + 递归整理整合
 // @include         https://115.com/*
@@ -3567,12 +3567,18 @@
         }
 
         function ensureStyle(doc) {
-            if (!doc || !doc.head) return;
-            if (doc.getElementById && doc.getElementById(STYLE_ID)) return;
-            var s = doc.createElement('style');
-            s.id = STYLE_ID;
-            s.textContent = css();
-            (doc.head || doc.documentElement).appendChild(s);
+            if (!doc) return;
+            // head 偶尔拿不到（文档还没建好），退到 documentElement，再不行就放弃 ——
+            // 但绝不能因此把整个挂载流程带崩，样式缺失只是难看，功能还在。
+            var host = doc.head || doc.documentElement || doc.body;
+            if (!host || typeof host.appendChild !== 'function') return;
+            try {
+                if (doc.getElementById && doc.getElementById(STYLE_ID)) return;
+                var s = doc.createElement('style');
+                s.id = STYLE_ID;
+                s.textContent = css();
+                host.appendChild(s);
+            } catch (e) { /* 样式注入失败不该影响入口可用性 */ }
         }
 
         /** 造一个工具栏按钮。opt = { label, dot, title, caret, menuTitle, items:[{label, onClick, sep}] } */
@@ -3630,16 +3636,27 @@
         /**
          * 把按钮挂到顶部工具栏。
          *   opts = {
-         *     id:     'mw115-tb-moviewall',   // slot 的 id（幂等键）
-         *     buttons:[{ label, dot, title, onClick, caret, menuTitle, items }]
+         *     id:       'mw-tb-moviewall',   // slot 的 id（幂等键）
+         *     buttons:  [{ label, dot, title, onClick, caret, menuTitle, items }]
+         *     fallback: () => 元素            // 挂不上时用的降级球
+         *     fallbackId: 'mw-fab'            // 降级球的 id，供巡逻清理
+         *     legacyFallbackIds: ['旧id']     // 历史版本遗留的降级球 id
          *   }
          * 返回 slot 元素；找不到工具栏返回 null（调用方自行降级到悬浮球）。
          */
         function mount(opts) {
             if (!opts || !opts.id) return null;
 
+            // ⚠️ 样式必须无条件注入，且要在定位之前 ——
+            //    定位失败会 return null，而降级球（.mw115-tb-fallback）用的
+            //    position:fixed 就来自这份 CSS。早先 ensureStyle 排在 return 之后，
+            //    于是挂不上工具栏时降级球是个裸 div：block 布局 + 通栏渐变背景，
+            //    直接横一条在页面底部，用户看到的就是「下面多了一条」。
+            ensureStyle(document);
+
             var host = null, before = null, doc = null;
             eachDocument(document, function (d) {
+                ensureStyle(d);   // iframe 内的顶栏也要有样式
                 var hit = findToolbar(d);
                 if (hit) { host = hit.host; before = hit.before; doc = d; return true; }
                 return false;
@@ -3647,8 +3664,6 @@
 
             // 找不到就返回 null —— 调用方负责回退到自己的悬浮入口。
             if (!host) return null;
-
-            ensureStyle(doc);
 
             var slot = doc.getElementById(opts.id);
             if (!slot || slot.parentElement !== host) {
@@ -3698,13 +3713,35 @@
          * 返回 { el, inToolbar: Boolean }
          */
         function mountOrFallback(opts) {
+            ensureStyle(document);
             var el = mount(opts);
             if (el) {
                 startWatch(opts);
                 return { el: el, inToolbar: true };
             }
             var fb = opts.fallback ? opts.fallback() : null;
-            if (fb && fb.parentNode !== document.body) document.body.appendChild(fb);
+            if (fb) {
+                // ⚠️ 不要改 fb.id —— id 是调用方的身份，靠它做幂等短路。
+                //    早先在这里覆写成 opts.id + '-fallback'，直接废掉了脚本里的
+                //    `if ($('#mw-fab')) return $('#mw-fab')[0]` ——
+                //    每次巡逻都新建一个球，页面上就堆出一排「多了一条」。
+                //    降级球的定位/尺寸用内联样式钉一遍：CSS 注入万一失败
+                //    （CSP 拦 style、head 拿不到），一个没约束的 div 会按 block
+                //    铺满整行，表现为「页面底部多了一条横条」。
+                if (fb.style) {
+                    fb.style.position = 'fixed';
+                    fb.style.right = '18px';
+                    fb.style.bottom = '88px';
+                    fb.style.zIndex = '9998';
+                    fb.style.display = 'inline-flex';
+                    fb.style.alignItems = 'center';
+                    fb.style.height = '36px';
+                    fb.style.padding = '0 14px';
+                    fb.style.borderRadius = '18px';
+                    fb.style.width = 'auto';
+                }
+                if (fb.parentNode !== document.body) document.body.appendChild(fb);
+            }
             startWatch(opts);
             return { el: fb, inToolbar: false };
         }
@@ -3719,6 +3756,29 @@
         function startWatch(opts) {
             if (!opts || opts._watching) return;
             opts._watching = true;
+
+            /**
+             * 清掉降级球。
+             * 球有各自的 id（影片墙 #mw-fab、整理助手 #av-organize-fab），核心不猜 ——
+             * 由调用方通过 opts.fallbackId 声明，另有 opts.legacyFallbackIds 收旧版遗留。
+             * ⚠️ 核心绝不能擅自覆写 fb.id：那会废掉脚本里
+             *    `if ($('#mw-fab')) return $('#mw-fab')[0]` 的幂等短路，
+             *    每次巡逻都新建一个球，页面上就堆出一排「多了一条」。
+             */
+            function clearFallbacks() {
+                var ids = (opts.legacyFallbackIds || []).slice();
+                if (opts.fallbackId) ids.unshift(opts.fallbackId);
+                for (var i = 0; i < ids.length; i++) {
+                    var n = document.getElementById(ids[i]);
+                    while (n) {
+                        var parent = n.parentNode;
+                        if (!parent) break;
+                        parent.removeChild(n);
+                        n = document.getElementById(ids[i]);   // 同一 id 可能有多个节点
+                    }
+                }
+            }
+
             setInterval(function () {
                 var slot = document.getElementById(opts.id);
                 var hit = findToolbar(document);
@@ -3726,17 +3786,20 @@
 
                 if (!alive) {
                     // 还挂在 body 上（降级态）就先撤掉，避免和工具栏按钮同时在场
-                    if (slot && slot.parentElement === document.body) slot.remove();
-                    var fbOld = document.getElementById(opts.id + '-fallback');
-                    if (fbOld) fbOld.remove();
+                    if (slot && slot.parentElement === document.body && slot.parentNode) {
+                        slot.parentNode.removeChild(slot);
+                    }
+                    clearFallbacks();
 
+                    // 核心不设 id：让脚本自己的 buildFallbackFab 走幂等短路，
+                    // 它复用的旧节点会带着正确的 id 回到页面上。
                     if (!mount(opts) && opts.fallback && document.body) {
                         var fb = opts.fallback();
-                        if (fb) {
-                            fb.id = opts.id + '-fallback';
-                            document.body.appendChild(fb);
-                        }
+                        if (fb) document.body.appendChild(fb);
                     }
+                } else {
+                    // 已经在工具栏上了 —— 把还残留的降级球清干净
+                    clearFallbacks();
                 }
             }, 1500);
         }
@@ -4005,7 +4068,7 @@
         };
     } catch (e) { /* ignore */ }
 
-    console.log('115整理助手 v2.9.0 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
+    console.log('115整理助手 v2.9.1 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
     /* ===== 入口：挂到 115 顶部工具栏（找不到才退回右下角悬浮球） =====
        工具栏下拉里的 13 项与右键菜单（第 22 节 rename_list）一一对应 ——
        两处共用同一批函数，右键菜单保留不动，当作工具栏挂不上时的第二条路。
@@ -4056,6 +4119,11 @@
         if (document.getElementById('av-tb-organize') || document.getElementById('av-organize-fab')) return;
         MW115Toolbar.mountOrFallback({
             id: 'av-tb-organize',
+            // 降级球的 id 要告诉核心，巡逻才能在挂上工具栏后把它清掉。
+            // 少了这两行：页面加载初期顶栏还没渲染好 → 先出降级球，
+            // 1.5s 后巡逻挂上工具栏按钮，但球留着 —— 两者同时在场。
+            fallbackId: 'av-organize-fab',
+            legacyFallbackIds: ['av-tb-organize-fallback'],
             buttons: [{
                 label: '整理',
                 dot: '#1890ff',

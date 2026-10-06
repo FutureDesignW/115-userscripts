@@ -288,8 +288,9 @@ function makeDoc(html) {
 }
 
 /** 把假文档装到全局 document/window 上，让核心里的 eachDocument(document, …) 能跑。
- *  跑完务必调 restoreGlobals() —— 核心模块是 require 进来的单例，
- *  全局 document 被换掉会影响后面所有测试。 */
+ *  跑完务必调返回的 restore() —— 核心模块是 require 进来的单例，
+ *  全局 document 被换掉会影响后面所有测试。
+ *  intervalFns 收集到 setInterval 注册的回调，测试里手动触发（等价于等 1.5s）。 */
 function installGlobals(api) {
   const saved = { document: global.document, window: global.window, setInterval: global.setInterval };
   const fakeWin = {
@@ -298,17 +299,26 @@ function installGlobals(api) {
     setTimeout: () => 0, clearTimeout() {},
     requestAnimationFrame: (fn) => { fn(); return 0; }
   };
+  const intervalFns = [];
   global.window = fakeWin;
   global.document = api;
   api.window = fakeWin;
-  // 核心用 setInterval 做重挂巡逻，Node 里不接住会挂着进程不放
-  global.setInterval = () => 0;
+  // 核心用 setInterval 做重挂巡逻。这里收下回调而不是真起定时器：
+  // Node 里不接住会挂着进程不放，而测试需要手动推进时间。
+  global.setInterval = (fn, ms) => { intervalFns.push({ fn, ms }); return intervalFns.length; };
   global.clearInterval = () => {};
-  return () => {
+  const restore = () => {
     global.document = saved.document;
     global.window = saved.window;
     global.setInterval = saved.setInterval;
   };
+  restore.tick = (n) => {
+    for (let i = 0; i < (n || intervalFns.length); i++) {
+      intervalFns.forEach((x) => { try { x.fn(); } catch (e) { /* 单次巡逻出错不该中断测试 */ } });
+    }
+  };
+  restore.intervals = intervalFns;
+  return restore;
 }
 
 /* ===========================================================================
@@ -512,14 +522,131 @@ test('降级路径：挂不上工具栏时退回悬浮球（inToolbar 为 false�
   }
 });
 
+test('回归：降级球和工具栏按钮不得同时在场（用户实机报「下面多了一条」）', () => {
+  // 真实时序：页面加载初期顶栏还没渲染好 → 首次 mount 失败、出降级球；
+  // 1.5s 后顶栏渲染出来，巡逻挂上工具栏按钮 —— 这时必须把球清掉。
+  // 全程同一个 document：核心的巡逻读的是全局 document，换文档就测不到真实行为。
+  const doc = makeDoc('<body><div id="placeholder">还没有顶栏</div></body>');
+  const restore = installGlobals(doc);
+  try {
+    let fbBuilt = 0;
+    const opts = {
+      id: 'tb-dup',
+      fallbackId: 'tb-dup-fab',
+      legacyFallbackIds: ['tb-dup-fab-old'],
+      buttons: [{ label: '影片墙', caret: true, items: [{ label: 'x', onClick() {} }] }],
+      fallback: function () {
+        fbBuilt++;
+        const d = doc.createElement('div');
+        d.id = 'tb-dup-fab';
+        d.className = 'mw115-tb-fallback';
+        return d;
+      }
+    };
+    const first = toolbar.mountOrFallback(opts);
+    assert.strictEqual(first.inToolbar, false, '首次就该走降级（顶栏还没渲染）');
+    assert.ok(doc.getElementById('tb-dup-fab'), '降级球应在页面上');
+
+    // 顶栏渲染出来了：把真实结构塞进 body
+    const hdr = makeDoc(NEW_HEADER_HTML);
+    const header = hdr.querySelector('.justify-between.w-full.pl-6.pr-5');
+    header.parent = doc.body;
+    doc.body.children.push(header);
+
+    // 手动推进 1.5s 巡逻
+    restore.intervals.forEach((x) => { try { x.fn(); } catch (e) { /* 巡逻出错不该中断测试 */ } });
+
+    const slot = doc.getElementById('tb-dup');
+    const fb = doc.getElementById('tb-dup-fab');
+    assert.ok(slot, '巡逻应把按钮挂上工具栏');
+    assert.ok(slot.parentElement && slot.parentElement.attrs.class === 'act-group',
+      'slot 该挂在动作区里');
+    assert.strictEqual(fb, null,
+      '挂上工具栏后降级球必须清掉 —— 两者同时在场就是用户看到的「下面多了一条」');
+    assert.strictEqual(fbBuilt, 1, '清掉之后不该再新建球（新建就是又一条）');
+  } finally {
+    restore();
+  }
+});
+
+test('回归：历史遗留的旧 id 降级球也会被清掉', () => {
+  const doc = makeDoc(NEW_HEADER_HTML);
+  const restore = installGlobals(doc);
+  try {
+    // 升级前就在页面上的旧球（id 是上一版核心生成的）
+    const stale = doc.createElement('div');
+    stale.id = 'tb-legacy-fallback';
+    stale.className = 'mw115-tb-fallback';
+    doc.body.appendChild(stale);
+
+    toolbar.mountOrFallback({
+      id: 'tb-legacy',
+      fallbackId: 'tb-legacy-fab',
+      legacyFallbackIds: ['tb-legacy-fallback'],
+      buttons: [{ label: 'A', onClick() {} }],
+      fallback: function () {
+        const d = doc.createElement('div');
+        d.id = 'tb-legacy-fab';
+        return d;
+      }
+    });
+    restore.intervals.forEach((x) => { try { x.fn(); } catch (e) { /* ignore */ } });
+
+    assert.ok(doc.getElementById('tb-legacy'), '工具栏按钮应挂上');
+    assert.strictEqual(doc.getElementById('tb-legacy-fallback'), null, '旧 id 的残留球要清掉');
+  } finally {
+    restore();
+  }
+});
+
+test('核心不改降级球的 id（否则会废掉脚本的幂等短路）', () => {
+  // 脚本的 buildFallbackFab 靠 `if ($('#mw-fab')) return $('#mw-fab')[0]` 复用旧节点。
+  // 核心一旦覆写 id，短路永久失效 —— 每次巡逻都新建一个球，页面上堆出一排。
+  const doc = makeDoc('<body><div>没有顶栏</div></body>');
+  const restore = installGlobals(doc);
+  try {
+    const made = [];
+    const res = toolbar.mountOrFallback({
+      id: 'tb-id',
+      buttons: [{ label: 'A', onClick() {} }],
+      fallback: function () {
+        const d = doc.createElement('div');
+        d.id = 'my-own-id';           // 脚本自己的 id
+        made.push(d);
+        return d;
+      }
+    });
+    assert.strictEqual(res.el.id, 'my-own-id', '核心不该改调用方的 id');
+    assert.strictEqual(made.length, 1);
+  } finally {
+    restore();
+  }
+});
+
 /* ===========================================================================
  * ③ 接线回归：工具栏入口这块全是「少一根线就静默失效」的地方
  * ======================================================================== */
 
 const readScript = (name) => fs.readFileSync(path.join(SCRIPTS_DIR, name), 'utf8');
 
-test('公共核心已内联进两个脚本，且 toolbar 不污染脚本作用域', () => {
-  ['115影片墙.user.js', '115整理助手.user.js'].forEach((name) => {
+test('两个脚本都声明了降级球 id（否则球清不掉，用户看到「下面多了一条」）', () => {
+  const cases = [
+    ['115影片墙.user.js', 'mw-fab'],
+    ['115整理助手.user.js', 'av-organize-fab']
+  ];
+  cases.forEach(([name, fabId]) => {
+    const src = readScript(name);
+    assert.ok(src.includes(`fallbackId: '${fabId}'`),
+      name + ` 缺 fallbackId: '${fabId}' —— 巡逻认不出该清哪个球`);
+    assert.ok(new RegExp(`legacyFallbackIds: \\['${name.startsWith('115影片墙') ? 'mw-tb-moviewall' : 'av-tb-organize'}-fallback'\\]`).test(src),
+      name + ' 缺 legacyFallbackIds（旧版残留的球 id）');
+    // 降级球自己的 id 必须跟 fallbackId 一致，否则核心和脚本说的不是同一个球
+    assert.ok(src.includes(`id = '${fabId}'`) || src.includes(`id: '${fabId}'`),
+      name + ` 里球的 id 应为 ${fabId}`);
+  });
+});
+
+test('公共核心已内联进两个脚本，且 toolbar 不污染脚本作用域', () => {  ['115影片墙.user.js', '115整理助手.user.js'].forEach((name) => {
     const src = readScript(name);
     assert.ok(src.includes('/* ==== MW115_TOOLBAR:BEGIN ==== */'), name + ' 缺少 TOOLBAR 标记区');
     assert.ok(src.includes('var MW115Toolbar = (function ()'), name + ' 未内联 toolbar 核心');
