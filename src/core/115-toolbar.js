@@ -380,10 +380,18 @@ var MW115Toolbar = (function () {
         return b;
     }
 
-    /** 关闭页面上所有已展开的下拉（点外部/点别的按钮时用）。 */
-    function closeAllSlots() {
+    /**
+     * 关闭页面上所有已展开的下拉（点外部/点别的按钮时用）。
+     * 带一个「豁免」参数：正在被打开的那个 slot 不参与本次关闭。
+     * 见按钮 handler 里的注释 —— 捕获阶段的全局关闭比按钮 handler 先跑，
+     * 不豁免的话 wasOpen 读到的永远是「已关」，于是再点一次又打开，永远关不掉。
+     */
+    function closeAllSlots(except) {
         var slots = document.querySelectorAll('.mw115-tb-slot.open');
-        for (var i = 0; i < slots.length; i++) slots[i].classList.remove('open');
+        for (var i = 0; i < slots.length; i++) {
+            if (except && slots[i] === except) continue;
+            slots[i].classList.remove('open');
+        }
     }
 
     /**
@@ -435,9 +443,16 @@ var MW115Toolbar = (function () {
                         e.stopPropagation();
                         var hasMenu = b.querySelector('.mw115-tb-menu');
                         if (hasMenu) {
+                            // ⚠️ closeAllSlots 必须把 slot 豁免掉。
+                            //    「点空白处收起」的监听绑在 document 的**捕获**阶段，
+                            //    比这个 handler 先跑 —— 它已经把 open 摘掉了，
+                            //    这里再读 wasOpen 永远是 false，于是 `if (!wasOpen)`
+                            //    恒成立，再点一次又打开，下拉永远关不掉
+                            //    （用户实机反馈「打开后就关不上了」）。
                             var wasOpen = slot.classList.contains('open');
-                            closeAllSlots();
-                            if (!wasOpen) slot.classList.add('open');
+                            closeAllSlots(slot);
+                            if (wasOpen) slot.classList.remove('open');
+                            else slot.classList.add('open');
                             return;
                         }
                         closeAllSlots();
@@ -451,11 +466,17 @@ var MW115Toolbar = (function () {
             else host.appendChild(slot);
         }
 
-        // 点空白处收起下拉（只绑一次）
+        // 点空白处收起下拉（只绑一次）。
+        // ⚠️ 这里用**冒泡**阶段而非捕获：捕获阶段会先于按钮自身 handler 把 open 摘掉，
+        //    按钮 handler 再读 wasOpen 就永远是 false —— 下拉只开never关（用户实机反馈）。
+        //    冒泡阶段则按钮 handler 先跑完（它自己 stopPropagation），全局关闭只兜住空白点击。
         if (!mount._docBound) {
             mount._docBound = true;
-            document.addEventListener('click', function () { closeAllSlots(); }, true);
+            document.addEventListener('click', function () { closeAllSlots(); });
             window.addEventListener('resize', closeAllSlots);
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape' || e.key === 'Esc') closeAllSlots();
+            });
         }
         return slot;
     }

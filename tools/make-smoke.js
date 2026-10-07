@@ -86,8 +86,25 @@ const page = `<!DOCTYPE html>
     if (btn) {
       btn.click();
       out.点主按钮开菜单 = slot.classList.contains('open');
+
+      // ⚠️ 再点一次必须收得起。用户实机报「打开后就关不上了」——
+      //    「点空白处收起」的监听绑在 document 捕获阶段，比按钮 handler 先跑，
+      //    handler 里再读 wasOpen 就永远是 false，于是只走 add('open') 分支。
+      //    这条必须在真浏览器里测：假 DOM 的事件模型曾经不跑捕获阶段，测不出来。
+      btn.click();
+      out.再点收得起 = !slot.classList.contains('open');
+
+      // 点空白处（body）也要收
+      btn.click();
+      document.body.click();
+      out.点空白收得起 = !slot.classList.contains('open');
+
       var item = slot.querySelector('.mw115-tb-menu a');
-      if (item) { item.click(); out.菜单项可点 = true; }
+      if (item) {
+        btn.click();                       // 先展开才能点菜单项
+        item.click();
+        out.菜单项可点 = true;
+      }
     }
     out.点击记录 = clicks.join(',') || '（无）';
   } catch (e) {
@@ -99,7 +116,8 @@ const page = `<!DOCTYPE html>
   var EXPECT = {
     '挂载成功': true, '进工具栏': true, '插入容器': 'act-group',
     '插在动作区最左': true, '降级球不该出现': true,
-    '点主按钮开菜单': true, '菜单项可点': true, '点击记录': 'open'
+    '点主按钮开菜单': true, '再点收得起': true, '点空白收得起': true,
+    '菜单项可点': true, '点击记录': 'open'
   };
   var pass = 0, total = 0;
   var lines = Object.keys(out).map(function (k) {

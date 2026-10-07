@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115影片墙
 // @namespace       cloud115.moviewall
-// @version         3.16.3
+// @version         3.16.4
 // @description     115 网盘影片墙（Emby 式）：直接读视频同目录下的海报/NFO（由本机 115 Media Hub 的「导出媒体文件」生成）；**素材实时存到本地**——NFO 原文/解析结果/海报原图自动落盘，缓存位置可选「浏览器本地」或「你自选的本机文件夹」（写成磁盘真实文件，可备份可复用），重开零请求秒出；卡片显示文件大小与码率；**新增「详情」面板**——剧情简介/标签/原名/厂牌/发行/系列/导演/时长/分级/国家/评分/数据来源 + 文件信息一屏看全（对齐 hub 的详情抽屉），卡片一行放不下的都在这里；排序支持 番号/文件名/目录/演员/类型/评分/观看日期/随机；**视图可切「海报墙 ⇄ 紧凑列表」**（列表一行一部，左侧小缩略图 + 右侧番号/标题/目录，扫番号更快，选择会记住）；勾选卡片可批量移动/删除并连带海报与 NFO，**做完原地摘卡片——不刷新页面、图不重下、滚动不跳**；**横版卡片默认用「横版高清」（-thumb/-fanart 里挑体积最大的那张：实测中位 776KB，是竖海报的 2.9 倍），可在设置里改成竖版海报或剧照；海报只有 147×200 时（约占 24%）会自动跳过糊图改用清晰图**
 // @author          cloud115.moviewall
 // @license         MIT
@@ -776,10 +776,18 @@
             return b;
         }
 
-        /** 关闭页面上所有已展开的下拉（点外部/点别的按钮时用）。 */
-        function closeAllSlots() {
+        /**
+         * 关闭页面上所有已展开的下拉（点外部/点别的按钮时用）。
+         * 带一个「豁免」参数：正在被打开的那个 slot 不参与本次关闭。
+         * 见按钮 handler 里的注释 —— 捕获阶段的全局关闭比按钮 handler 先跑，
+         * 不豁免的话 wasOpen 读到的永远是「已关」，于是再点一次又打开，永远关不掉。
+         */
+        function closeAllSlots(except) {
             var slots = document.querySelectorAll('.mw115-tb-slot.open');
-            for (var i = 0; i < slots.length; i++) slots[i].classList.remove('open');
+            for (var i = 0; i < slots.length; i++) {
+                if (except && slots[i] === except) continue;
+                slots[i].classList.remove('open');
+            }
         }
 
         /**
@@ -831,9 +839,16 @@
                             e.stopPropagation();
                             var hasMenu = b.querySelector('.mw115-tb-menu');
                             if (hasMenu) {
+                                // ⚠️ closeAllSlots 必须把 slot 豁免掉。
+                                //    「点空白处收起」的监听绑在 document 的**捕获**阶段，
+                                //    比这个 handler 先跑 —— 它已经把 open 摘掉了，
+                                //    这里再读 wasOpen 永远是 false，于是 `if (!wasOpen)`
+                                //    恒成立，再点一次又打开，下拉永远关不掉
+                                //    （用户实机反馈「打开后就关不上了」）。
                                 var wasOpen = slot.classList.contains('open');
-                                closeAllSlots();
-                                if (!wasOpen) slot.classList.add('open');
+                                closeAllSlots(slot);
+                                if (wasOpen) slot.classList.remove('open');
+                                else slot.classList.add('open');
                                 return;
                             }
                             closeAllSlots();
@@ -847,11 +862,17 @@
                 else host.appendChild(slot);
             }
 
-            // 点空白处收起下拉（只绑一次）
+            // 点空白处收起下拉（只绑一次）。
+            // ⚠️ 这里用**冒泡**阶段而非捕获：捕获阶段会先于按钮自身 handler 把 open 摘掉，
+            //    按钮 handler 再读 wasOpen 就永远是 false —— 下拉只开never关（用户实机反馈）。
+            //    冒泡阶段则按钮 handler 先跑完（它自己 stopPropagation），全局关闭只兜住空白点击。
             if (!mount._docBound) {
                 mount._docBound = true;
-                document.addEventListener('click', function () { closeAllSlots(); }, true);
+                document.addEventListener('click', function () { closeAllSlots(); });
                 window.addEventListener('resize', closeAllSlots);
+                document.addEventListener('keydown', function (e) {
+                    if (e.key === 'Escape' || e.key === 'Esc') closeAllSlots();
+                });
             }
             return slot;
         }

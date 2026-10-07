@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115整理助手 (115Rename2026 + 递归整理)
 // @namespace       https://github.com/liuchanghuaX1/115Rename2026
-// @version         2.9.3
+// @version         2.9.4
 // @description     在 115Rename2026 基础上整合「递归整理」：递归扫描当前目录及全部子目录 → 去掉文件名里的干扰词 → 抽取番号 → 视频汇总到当前目录 → 按所选「重命名方式」改名（本地优先，缺信息的条目才联网） → 清空已空的子目录。重命名方式 7 种可选，并支持**在整理预览面板里就地自定义模板**（`{code}{title}{actress}{date}{rating}{markers}` 变量按钮、实时重算、不联网）。改名后可在菜单里**一键撤销上次改名**。
 // @author          sonarlee (原始引擎) + 递归整理整合
 // @include         https://115.com/*
@@ -3699,10 +3699,18 @@
             return b;
         }
 
-        /** 关闭页面上所有已展开的下拉（点外部/点别的按钮时用）。 */
-        function closeAllSlots() {
+        /**
+         * 关闭页面上所有已展开的下拉（点外部/点别的按钮时用）。
+         * 带一个「豁免」参数：正在被打开的那个 slot 不参与本次关闭。
+         * 见按钮 handler 里的注释 —— 捕获阶段的全局关闭比按钮 handler 先跑，
+         * 不豁免的话 wasOpen 读到的永远是「已关」，于是再点一次又打开，永远关不掉。
+         */
+        function closeAllSlots(except) {
             var slots = document.querySelectorAll('.mw115-tb-slot.open');
-            for (var i = 0; i < slots.length; i++) slots[i].classList.remove('open');
+            for (var i = 0; i < slots.length; i++) {
+                if (except && slots[i] === except) continue;
+                slots[i].classList.remove('open');
+            }
         }
 
         /**
@@ -3754,9 +3762,16 @@
                             e.stopPropagation();
                             var hasMenu = b.querySelector('.mw115-tb-menu');
                             if (hasMenu) {
+                                // ⚠️ closeAllSlots 必须把 slot 豁免掉。
+                                //    「点空白处收起」的监听绑在 document 的**捕获**阶段，
+                                //    比这个 handler 先跑 —— 它已经把 open 摘掉了，
+                                //    这里再读 wasOpen 永远是 false，于是 `if (!wasOpen)`
+                                //    恒成立，再点一次又打开，下拉永远关不掉
+                                //    （用户实机反馈「打开后就关不上了」）。
                                 var wasOpen = slot.classList.contains('open');
-                                closeAllSlots();
-                                if (!wasOpen) slot.classList.add('open');
+                                closeAllSlots(slot);
+                                if (wasOpen) slot.classList.remove('open');
+                                else slot.classList.add('open');
                                 return;
                             }
                             closeAllSlots();
@@ -3770,11 +3785,17 @@
                 else host.appendChild(slot);
             }
 
-            // 点空白处收起下拉（只绑一次）
+            // 点空白处收起下拉（只绑一次）。
+            // ⚠️ 这里用**冒泡**阶段而非捕获：捕获阶段会先于按钮自身 handler 把 open 摘掉，
+            //    按钮 handler 再读 wasOpen 就永远是 false —— 下拉只开never关（用户实机反馈）。
+            //    冒泡阶段则按钮 handler 先跑完（它自己 stopPropagation），全局关闭只兜住空白点击。
             if (!mount._docBound) {
                 mount._docBound = true;
-                document.addEventListener('click', function () { closeAllSlots(); }, true);
+                document.addEventListener('click', function () { closeAllSlots(); });
                 window.addEventListener('resize', closeAllSlots);
+                document.addEventListener('keydown', function (e) {
+                    if (e.key === 'Escape' || e.key === 'Esc') closeAllSlots();
+                });
             }
             return slot;
         }
@@ -4137,7 +4158,7 @@
         };
     } catch (e) { /* ignore */ }
 
-    console.log('115整理助手 v2.9.3 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
+    console.log('115整理助手 v2.9.4 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
     /* ===== 入口：挂到 115 顶部工具栏（找不到才退回右下角悬浮球） =====
        工具栏下拉里的 13 项与右键菜单（第 22 节 rename_list）一一对应 ——
        两处共用同一批函数，右键菜单保留不动，当作工具栏挂不上时的第二条路。
@@ -4212,5 +4233,110 @@
             else if (++n > 100) clearInterval(t);
         }, 300);
     })();
+
+    /* ========================================================================
+     * 24. 关掉 115 的推广弹窗（默认开启，可在菜单里关）
+     *
+     * 用户实机反馈：进网盘就被「NEW 重磅升级 / VIP专享权益」弹窗糊脸，
+     * 挡着内容还带营销链接。
+     *
+     * 识别用「文案特征」而不是 class/id —— 115 的 class 是构建产物、每次发版都在变，
+     * 这跟工具栏定位踩过的是同一个坑。文案（VIP专享权益 / 了解更多 / 重磅升级）
+     * 是投放素材里写死的，稳定得多。
+     *
+     * 两道保险（任一命中即关）：
+     *   ① 扫描已存在的浮层：文案特征命中 ≥2 句 + 是 fixed/absolute 浮层 + 带关闭按钮 → 点它自己的关闭按钮再摘掉
+     *   ② MutationObserver 盯着新插入的节点（弹窗是延迟注入的，页面加载完才有）
+     * ======================================================================== */
+
+    const AD_SWITCH_KEY = 'kill115Ad';
+    // 投放素材里的固定文案 —— 换一批（class 会变，这些不会）
+    const AD_TEXTS = ['VIP专享权益', '重磅升级', '了解更多', '立即升级', '限时特惠', '开通会员'];
+    // 开关状态（默认开启）。⚠️ 必须声明在 killAds 之前 —— let 有 TDZ，
+    // 「声明和使用顺序反了」这类错在小脚本里很难一眼看出来。
+    let CFG_KILL_AD = GM_getValue(AD_SWITCH_KEY, true);
+
+    /** 判断一个浮层是不是广告弹窗。条件要够严，别误杀正常弹窗。 */
+    const isAdLayer = (el) => {
+        if (!el || el.nodeType !== 1) return false;
+        if (el.closest('#mw-overlay, .av-overlay, .custom-notification')) return false;  // 本脚本自己的
+        const tag = el.tagName;
+        if (!/^(DIV|SECTION|ASIDE)$/.test(tag)) return false;
+        const cs = getComputedStyle(el);
+        // 必须是浮层（fixed/absolute + 有尺寸），否则页面里任何一个 div 都会被当成弹窗
+        if (!/fixed|absolute/.test(cs.position)) return false;
+        if (!(el.offsetWidth > 120 && el.offsetHeight > 80)) return false;
+        const text = normAdText(el.textContent);
+        if (text.length > 900) return false;          // 正文太长的多半不是弹窗
+        // 文案特征至少命中两句 —— 单句容易误伤（比如正文里提到「了解更多」）
+        const hits = AD_TEXTS.filter((t) => text.indexOf(t) >= 0);
+        if (hits.length < 2) return false;
+        // 带关闭按钮才算弹窗（不关的话用户走不掉）
+        const hasClose = el.querySelector('[aria-label*="关闭"], [title*="关闭"], .close, [class*="close"]');
+        return !!hasClose;
+    };
+    const normAdText = (s) => String(s || '').replace(/\s+/g, '');
+
+    /** 关掉一个弹窗：优先点它自己的关闭按钮（这样 115 内部的「已读」状态也能同步）。 */
+    const killAdLayer = (el) => {
+        if (!el || !el.parentNode) return;
+        try {
+            const btn = el.querySelector('[aria-label*="关闭"], [title*="关闭"], [class*="close"]');
+            if (btn && typeof btn.click === 'function') { btn.click(); }
+        } catch (e) { /* ignore */ }
+        if (el.parentNode) el.parentNode.removeChild(el);
+    };
+
+    const killAds = () => {
+        if (!CFG_KILL_AD) return 0;
+        let n = 0;
+        // ① 已存在的
+        try {
+            const all = document.querySelectorAll('div,section,aside');
+            for (let i = 0; i < all.length; i++) {
+                if (isAdLayer(all[i])) { killAdLayer(all[i]); n++; }
+            }
+        } catch (e) { /* ignore */ }
+        // ② 之后新注入的
+        if (!killAds._obs && CFG_KILL_AD && window.MutationObserver) {
+            const obs = new MutationObserver((muts) => {
+                // 用户在菜单里关掉了拦截 → 立刻停观察，别继续扫 DOM
+                if (!CFG_KILL_AD) { obs.disconnect(); killAds._obs = null; return; }
+                muts.forEach((m) => {
+                    (m.addedNodes || []).forEach((node) => {
+                        if (isAdLayer(node)) killAdLayer(node);
+                        else if (node.querySelectorAll) {
+                            const sub = node.querySelectorAll('div,section,aside');
+                            for (let i = 0; i < sub.length; i++) if (isAdLayer(sub[i])) killAdLayer(sub[i]);
+                        }
+                    });
+                });
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+            killAds._obs = obs;      // 存实例，关开关时能真的 disconnect
+        }
+        return n;
+    };
+
+    // 弹窗是延迟注入的：一开就扫 + 之后持续盯
+    if (CFG_KILL_AD) {
+        killAds();
+        setTimeout(killAds, 1200);
+        setTimeout(killAds, 3000);
+        // 路由切换后可能又弹一次
+        window.addEventListener('hashchange', () => setTimeout(killAds, 300));
+        ['mouseup', 'keydown'].forEach((ev) =>
+            document.addEventListener(ev, () => setTimeout(killAds, 200), true));
+    }
+
+    // 菜单项文案带状态前缀，Tampermonkey 的菜单不支持原地刷新，
+    // 所以切换后用 toast 告知当前状态；下次打开菜单时前缀会跟着变。
+    GM_registerMenuCommand(CFG_KILL_AD ? '✓ 115 广告弹窗：已拦截（点击关闭）' : '115 广告弹窗：未拦截（点击开启）', () => {
+        CFG_KILL_AD = !CFG_KILL_AD;
+        GM_setValue(AD_SWITCH_KEY, CFG_KILL_AD);
+        showPageNotification(CFG_KILL_AD ? '已开启广告拦截' : '已关闭广告拦截（115 的弹窗会回来）', 'info', 3000);
+        if (CFG_KILL_AD) killAds();
+        else if (killAds._obs) { killAds._obs.disconnect(); killAds._obs = null; }
+    });
 
 })();

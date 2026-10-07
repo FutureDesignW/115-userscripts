@@ -121,22 +121,46 @@ function classListOf(node) {
   };
 }
 
-/** 事件：只存 click 这一个类型够用，但要能 preventDefault / stopPropagation。 */
+/**
+ * 事件：只存 click 这一个类型够用，但要能 preventDefault / stopPropagation。
+ * ⚠️ 必须实现**捕获 → 目标 → 冒泡**三个阶段 —— 挂载器的「点空白处收起下拉」
+ *    绑在 document 的捕获阶段，比按钮自身的 handler 先跑。早先这里只跑目标节点，
+ *    于是「再点一次收不起」这个 bug 在单测里测不出来（用户实机才暴露）。
+ */
 function eventify(node) {
-  node._handlers = {};
-  node.addEventListener = function (type, fn) {
-    (this._handlers[type] = this._handlers[type] || []).push(fn);
+  node._handlers = {};        // { type: [{fn, capture}] }
+  node.addEventListener = function (type, fn, capture) {
+    (this._handlers[type] = this._handlers[type] || []).push({ fn, capture: !!capture });
   };
   node.removeEventListener = function (type, fn) {
     const arr = this._handlers[type] || [];
-    const i = arr.indexOf(fn);
+    const i = arr.findIndex((h) => h.fn === fn);
     if (i >= 0) arr.splice(i, 1);
   };
   node.dispatchEvent = function (ev) {
     if (!ev.preventDefault) ev.preventDefault = () => {};
-    if (!ev.stopPropagation) ev.stopPropagation = () => {};
-    (this._handlers[ev.type] || []).slice().forEach((fn) => fn(ev));
-    return true;
+    let stopped = false;
+    if (!ev.stopPropagation) ev.stopPropagation = () => { stopped = true; };
+    ev.target = ev.target || this;
+
+    // 祖先链：document 在最外层（事件的根），然后往上到 window
+    const chain = [];
+    let p = this.parent;
+    while (p) { chain.unshift(p); p = p.parent; }
+    const rootDoc = global.document;
+    if (rootDoc && rootDoc._handlers) chain.unshift(rootDoc);
+
+    const fire = (n) => ((n._handlers && n._handlers[ev.type]) || [])
+      .filter((h) => h.capture)
+      .forEach((h) => { if (!stopped) h.fn(ev); });
+    const bubble = (n) => ((n._handlers && n._handlers[ev.type]) || [])
+      .filter((h) => !h.capture)
+      .forEach((h) => { if (!stopped) h.fn(ev); });
+
+    chain.forEach(fire);                       // ① 捕获：document → ... → 父
+    (this._handlers[ev.type] || []).forEach((h) => h.fn(ev));   // ② 目标
+    if (!stopped) chain.slice().reverse().forEach(bubble);     // ③ 冒泡：父 → ... → document
+    return !ev.defaultPrevented;
   };
   node.click = function () { return this.dispatchEvent({ type: 'click', target: this }); };
 }
@@ -274,25 +298,22 @@ function makeDoc(html) {
   // nextSibling / parentElement 已在 decorate 里做成 getter（插入后会变）
   api.setHidden = (node) => api.hidden.add(node);
   api.visible = (node) => !api.hidden.has(node);
-  // 文档自身也要能挂监听（核心绑「点空白处收起下拉」在 document 上）
+  // 文档自身也要能挂监听（核心绑「点空白处收起下拉」在 document 的捕获阶段）
   eventify(api);
-  api.addEventListener = function (type, fn) {
-    (this._handlers[type] = this._handlers[type] || []).push(fn);
-  };
-  api.dispatchEvent = function (ev) {
-    if (!ev.preventDefault) ev.preventDefault = () => {};
-    if (!ev.stopPropagation) ev.stopPropagation = () => {};
-    (this._handlers[ev.type] || []).slice().forEach((fn) => fn(ev));
-  };
   return api;
 }
 
 /** 把假文档装到全局 document/window 上，让核心里的 eachDocument(document, …) 能跑。
  *  跑完务必调返回的 restore() —— 核心模块是 require 进来的单例，
  *  全局 document 被换掉会影响后面所有测试。
- *  intervalFns 收集到 setInterval 注册的回调，测试里手动触发（等价于等 1.5s）。 */
+ *  intervalFns 收集到 setInterval 注册的回调，测试里手动触发（等价于等 1.5s）。
+ *
+ *  ⚠️ mount._docBound 是**函数属性**，在 Node 里跨测试粘滞 —— 真实浏览器只有一个
+ *    document 所以没问题，但每个测试都是新假文档，监听会绑到上一次的旧文档上，
+ *    于是「点空白处收起」在新文档里根本不触发。这里一并重置。 */
 function installGlobals(api) {
   const saved = { document: global.document, window: global.window, setInterval: global.setInterval };
+  toolbar.mount._docBound = false;
   const fakeWin = {
     getComputedStyle: null,
     addEventListener() {}, removeEventListener() {},
@@ -700,6 +721,65 @@ test('回归：SPA 在播放页↔列表页之间切，入口跟着撤/补', () 
   }
 });
 
+test('回归：下拉菜单能开关（曾绑在捕获阶段，导致 wasOpen 恒为 false、只开never关）', () => {
+  const doc = makeDoc(NEW_HEADER_HTML);
+  const restore = installGlobals(doc);
+  try {
+    const slot = toolbar.mount({
+      id: 'tb-toggle',
+      buttons: [{ label: '影片墙', caret: true, menuTitle: '影片墙', items: [{ label: 'x', onClick() {} }] }]
+    });
+    const btn = slot.querySelector('.mw115-tb-btn');
+
+    // 开 → 关 → 开，三轮都必须稳定
+    for (let i = 1; i <= 3; i++) {
+      btn.click();
+      assert.strictEqual(slot.classList.contains('open'), true, `第 ${i} 次点应打开`);
+      btn.click();
+      assert.strictEqual(slot.classList.contains('open'), false,
+        `第 ${i} 次再点应收起 —— 「点空白处收起」若绑在捕获阶段，` +
+        '会在按钮 handler 之前摘掉 open，wasOpen 恒为 false，只开never关');
+    }
+
+    // 点空白也要收
+    btn.click();
+    assert.strictEqual(slot.classList.contains('open'), true);
+    doc.body.click();
+    assert.strictEqual(slot.classList.contains('open'), false, '点空白应收起');
+
+    // Escape 也要收
+    btn.click();
+    assert.strictEqual(slot.classList.contains('open'), true);
+    doc.dispatchEvent({ type: 'keydown', key: 'Escape' });
+    assert.strictEqual(slot.classList.contains('open'), false, 'Escape 应收起');
+  } finally {
+    restore();
+  }
+});
+
+test('回归：两个 slot 同时挂载，点一个不影响另一个的状态判定', () => {
+  const doc = makeDoc(NEW_HEADER_HTML);
+  const restore = installGlobals(doc);
+  try {
+    const a = toolbar.mount({ id: 'tb-a', buttons: [{ label: 'A', caret: true, items: [{ label: 'a', onClick() {} }] }] });
+    const b = toolbar.mount({ id: 'tb-b', buttons: [{ label: 'B', caret: true, items: [{ label: 'b', onClick() {} }] }] });
+    const btnA = a.querySelector('.mw115-tb-btn');
+    const btnB = b.querySelector('.mw115-tb-btn');
+
+    btnA.click();
+    assert.strictEqual(a.classList.contains('open'), true, 'A 应打开');
+    // 点 B：A 自动收起，B 打开 —— 两个 slot 各自的 toggle 不能串味
+    btnB.click();
+    assert.strictEqual(a.classList.contains('open'), false, '点 B 时 A 应收起');
+    assert.strictEqual(b.classList.contains('open'), true, 'B 应打开');
+    // 再点 B：B 自己应收起（不能被自己的 closeAllSlots 提前关掉又立刻打开）
+    btnB.click();
+    assert.strictEqual(b.classList.contains('open'), false, '再点 B 应收起');
+  } finally {
+    restore();
+  }
+});
+
 test('核心不改降级球的 id（否则会废掉脚本的幂等短路）', () => {
   // 脚本的 buildFallbackFab 靠 `if ($('#mw-fab')) return $('#mw-fab')[0]` 复用旧节点。
   // 核心一旦覆写 id，短路永久失效 —— 每次巡逻都新建一个球，页面上堆出一排。
@@ -826,6 +906,32 @@ test('整理助手：没设归档根目录时不弹常驻状态条（用户实�
     '设根目录后不该再挂常驻状态条');
   // 兜底：状态条 8s 后自动淡出
   assert.ok(/@keyframes archiveRootFade/.test(src), '状态条应加自动淡出动画');
+});
+
+test('整理助手：默认拦截 115 广告弹窗，且可关闭', () => {
+  const src = readScript('115整理助手.user.js');
+  // 默认开：GM_getValue 的默认值必须是 true
+  assert.ok(/let CFG_KILL_AD = GM_getValue\(AD_SWITCH_KEY, true\)/.test(src),
+    '广告拦截应默认开启');
+  // 文案特征识别（不能用 class —— 115 的 class 每次发版都变）
+  ['VIP专享权益', '了解更多', '重磅升级'].forEach((t) => {
+    assert.ok(src.includes(`'${t}'`), `AD_TEXTS 应含「${t}」`);
+  });
+  // 识别条件要够严：浮层 + 有尺寸 + 命中≥2句 + 带关闭按钮
+  const fn = src.slice(src.indexOf('const isAdLayer'));
+  const body = fn.slice(0, fn.indexOf('const normAdText'));
+  assert.ok(/position/.test(body), '应校验 position（只对浮层动手）');
+  assert.ok(/offsetWidth/.test(body), '应校验尺寸');
+  assert.ok(/hits\.length < 2/.test(body), '文案命中应要求 ≥2 句，避免误杀');
+  assert.ok(/hasClose/.test(body), '应要求带关闭按钮（否则误杀正常浮层）');
+  // 延迟注入 → 必须有观察器兜着（在 killAds 里）
+  const kill = src.slice(src.indexOf('const killAds'));
+  assert.ok(/MutationObserver/.test(kill), '弹窗是延迟注入的，需要 MutationObserver');
+  assert.ok(/subtree: true/.test(kill), '观察器要盯 subtree（弹窗可能挂在深处）');
+  // 优先点它自己的关闭按钮：这样 115 内部的「已读」状态能同步
+  assert.ok(/btn\.click\(\)/.test(src), '应先点它自己的关闭按钮再摘除');
+  // 开关可关
+  assert.ok(/GM_registerMenuCommand[\s\S]{0,200}广告/.test(src), '应有菜单开关');
 });
 
 test('整理助手：13 项动作都进了工具栏下拉', () => {
