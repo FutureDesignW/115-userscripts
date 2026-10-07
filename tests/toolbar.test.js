@@ -1008,3 +1008,39 @@ test('整理助手：右键菜单仍保留（工具栏挂不上时的第二条�
   assert.ok(src.includes('id="rename_list"'), '右键菜单被误删');
   assert.ok(/\$\("a#undo_last_rename"\)\.off\("click"\)/.test(src), '右键菜单绑定丢了');
 });
+
+test('整理助手：站内推广链接也拦（纯文字那种，v2.9.6）', () => {
+  const src = readScript('115整理助手.user.js');
+  // 实测样本（用户右键检查复制回来的）：
+  //   <a href="https://www.115.com/17?f=ad1#&f=ad2#">你的回忆 · 一直都存在</a>
+  // 没有 img、没有 iframe、文案也不在 AD_TEXTS 里 —— 前三套判定全漏。
+  // 破绽在 href 上：115 自己给投放位打了 f=ad1/f=ad2 的渠道标记。
+  assert.ok(/const AD_LINK_MARKS = \['f=ad'\]/.test(src), '缺链接渠道标记表');
+  assert.ok(/const AD_LINK_SEL = 'a\[href\*="f=ad"\]'/.test(src),
+    '缺属性选择器 —— 不能遍历全部 <a>（文件列表页几百个链接，killAds 还挂在 mouseup 上）');
+  assert.ok(/const isAdAnchor = \(el\)/.test(src), '缺 isAdAnchor');
+  assert.ok(/const killAdAnchor = \(a\)/.test(src), '缺 killAdAnchor');
+
+  const isAd = src.slice(src.indexOf('const isAdAnchor'));
+  const isAdBody = isAd.slice(0, isAd.indexOf('const killAdAnchor'));
+  assert.ok(/tagName !== 'A'/.test(isAdBody), '只该处理 <a>');
+  assert.ok(/AD_LINK_MARKS\.some/.test(isAdBody), '应按渠道标记判定');
+  assert.ok(/hasText \|\| hasMedia/.test(isAdBody), '要先确认有内容再摘（别动隐藏锚点）');
+  assert.ok(/mw-overlay/.test(isAdBody), '要排除本脚本自己的 UI');
+
+  // 独占性校验 —— 无脑往上摘会捅掉整个侧栏
+  const kill = src.slice(src.indexOf('const killAdAnchor'));
+  const killBody = kill.slice(0, kill.indexOf('const killAdLayer'));
+  assert.ok(/dirty/.test(killBody), '往上摘之前要校验父容器独占性');
+  assert.ok(/parentNode\.removeChild/.test(killBody), '应摘除容器');
+
+  // 三个入口都要挂上：主扫描 + 观察器(节点自身/子树)
+  assert.ok(/isAdAnchor\(links\[i\]\)/.test(src), 'killAds 主扫描应处理推广链接');
+  assert.ok(/isAdAnchor\(node\)/.test(src), '观察器应处理新插入的推广链接');
+  assert.ok(/isAdAnchor\(sub\[i\]\)/.test(src), '观察器子树扫描应处理推广链接');
+
+  // 调试出口
+  assert.ok(/links: \(\) =>/.test(src), '__avAd 应有 links()（列出带渠道标记的链接）');
+  assert.ok(/AD_URL_PATTERNS, AD_LINK_MARKS/.test(src), '__avAd 应导出 AD_LINK_MARKS');
+  assert.ok(/识别到的推广链接/.test(src), 'scan() 应报告推广链接');
+});

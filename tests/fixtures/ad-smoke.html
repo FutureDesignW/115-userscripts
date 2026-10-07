@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>广告拦截 · 冒烟测试</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #fafbfc; }
+  .hdr { padding: 16px 24px; font-size: 18px; font-weight: 600; }
+  .ad-float { position: fixed; right: 16px; bottom: 80px; width: 200px; height: 120px;
+              background: #eef; border: 1px solid #ccd; border-radius: 8px; }
+  .side { position: fixed; left: 0; top: 80px; width: 160px; background: #fff;
+          border-right: 1px solid #e5e6eb; padding: 8px; }
+  .side a { display: block; padding: 6px 8px; font-size: 13px; }
+  .normal { padding: 12px 24px; }
+  .ad-wrap { padding: 10px; border: 1px dashed #ccd; margin: 12px 24px; }
+  .ad-inner { padding: 8px; }
+  #result { margin: 20px 24px; padding: 14px 16px; background: #fff; border: 1px solid #e5e6eb;
+            border-radius: 8px; font: 13px/1.7 ui-monospace, Consolas, monospace; white-space: pre-wrap; }
+  .ok { color: #67c23a; } .bad { color: #f56c6c; }
+</style></head>
+<body>
+<div class="hdr">广告拦截冒烟测试</div>
+
+<div class="ad-float" id="case1">
+  <a ref="href" href="https://www.115.com/17?f=ad1#&amp;f=ad2#" target="_top"><s ref="text">你的回忆 · 一直都存在</s></a>
+</div>
+
+<div class="side" id="case2">
+  <a href="https://www.115.com/17?f=ad1">推广位</a>
+  <a href="https://115.com/?ct=file">我的文件</a>
+</div>
+
+<div class="normal" id="case3">
+  <a href="https://115.com/?ct=file&amp;ac=snapshot">正常链接</a>
+</div>
+
+<div class="ad-wrap" id="case4">
+  <div class="ad-inner">
+    <a href="https://www.115.com/17?f=ad2">另一个推广位</a>
+  </div>
+</div>
+
+<div id="result">运行中…</div>
+
+<script>
+  window.GM_getValue = function () { return true; };   // 模块顶层的开关默认值
+  window.GM_setValue = function () {};
+</script>
+<script>const AD_SWITCH_KEY = 'kill115Ad';
+    // 投放素材里的固定文案 —— 换一批（class 会变，这些不会）
+    const AD_TEXTS = ['VIP专享权益', '重磅升级', '了解更多', '立即升级', '限时特惠', '开通会员',
+        '你的回忆', '一直都存在'];
+    // 图片型广告的地址特征（右下角那个广告位靠这个认：它是图片，不是文字）
+    const AD_URL_PATTERNS = [
+        '115cdn.com/ad', 'ad.115', 'adimg.115', '115.com/ad',
+        'advert', 'promotion', 'tanx.com', 'alimama', 'baidu.com/ad',
+        'gdt.qq.com', 'mmstat.com', 'doubleclick', 'adservice'
+    ];
+    // 站内推广位的**链接渠道标记** —— 115 自己给投放位打的，比 class 稳得多。
+    //   实测样本：<a href="https://www.115.com/17?f=ad1#&f=ad2#">你的回忆 · 一直都存在</a>
+    //   `f=` 是 115 的来源渠道参数，投放位固定带 ad 序号。
+    //   写 `f=ad` 一条即可覆盖 ad1/ad2/ad3…（留成数组是为了以后要收紧时好改）
+    const AD_LINK_MARKS = ['f=ad'];
+    // ⚠️ 性能：用属性选择器让浏览器原生过滤，别遍历页面上全部 <a>
+    //    （文件列表页动辄几百个链接，而 killAds 还挂在 mouseup/keydown 上跑）
+    const AD_LINK_SEL = 'a[href*="f=ad"]';
+    // ⚠️ 115 的广告容器 class 目前没实测到（不敢乱写，误伤代价大）。
+    //    定位到之后填这里即可生效；留空数组 = 不启用这条判定。
+    const AD_CLASS_HINTS = [];
+    // 开关状态（默认开启）。⚠️ 必须声明在 killAds 之前 —— let 有 TDZ，
+    // 「声明和使用顺序反了」这类错在小脚本里很难一眼看出来。
+    let CFG_KILL_AD = GM_getValue(AD_SWITCH_KEY, true);
+
+    /** 判断一个浮层是不是广告弹窗。条件要够严，别误杀正常弹窗。 */
+    const isAdLayer = (el) => {
+        if (!el || el.nodeType !== 1) return false;
+        if (el.closest('#mw-overlay, .av-overlay, .custom-notification')) return false;  // 本脚本自己的
+        const tag = el.tagName;
+        if (!/^(DIV|SECTION|ASIDE)$/.test(tag)) return false;
+        const cs = getComputedStyle(el);
+        // 必须是浮层（fixed/absolute + 有尺寸），否则页面里任何一个 div 都会被当成弹窗
+        if (!/fixed|absolute/.test(cs.position)) return false;
+        if (!(el.offsetWidth > 120 && el.offsetHeight > 80)) return false;
+        const text = normAdText(el.textContent);
+        if (text.length > 900) return false;          // 正文太长的多半不是弹窗
+        // 文案特征至少命中两句 —— 单句容易误伤（比如正文里提到「了解更多」）
+        const hits = AD_TEXTS.filter((t) => text.indexOf(t) >= 0);
+        if (hits.length < 2) return false;
+        // 带关闭按钮才算弹窗（不关的话用户走不掉）
+        const hasClose = el.querySelector('[aria-label*="关闭"], [title*="关闭"], .close, [class*="close"]');
+        return !!hasClose;
+    };
+    const normAdText = (s) => String(s || '').replace(/\s+/g, '');
+
+    /**
+     * 判断一个媒体元素（img/iframe）是不是广告素材。
+     * 右下角那个广告位是**图片**，文案特征一点都命中不了 —— 只能看地址。
+     */
+    const isAdMedia = (el) => {
+        if (!el || el.nodeType !== 1) return false;
+        const tag = el.tagName;
+        if (tag !== 'IMG' && tag !== 'IFRAME') return false;
+        if (el.closest('#mw-overlay, .av-overlay')) return false;
+        // 尺寸门槛：小图标、头像、表情不该被摘
+        if (tag === 'IMG' && !(el.offsetWidth >= 80 && el.offsetHeight >= 50)) return false;
+        // src / data-src / alt / 祖先 href 一起看 —— 广告常把真实地址放 data-* 上
+        let bits = [
+            el.src || '', el.getAttribute('data-src') || '', el.getAttribute('data-original') || '',
+            el.getAttribute('alt') || '', el.getAttribute('title') || ''
+        ].join(' ').toLowerCase();
+        try {
+            const a = el.closest ? el.closest('a') : null;
+            if (a) bits += ' ' + (a.href || '');
+        } catch (e) { /* ignore */ }
+        if (!bits) return false;
+        return AD_URL_PATTERNS.some((p) => bits.indexOf(p) >= 0);
+    };
+
+    /**
+     * 摘掉广告素材。
+     * ⚠️ 不能只 removeChild(img) —— 那样留个空洞，页面看着更怪。
+     *    往上找到「负责定位的那个容器」（fixed/absolute 且有尺寸）一起摘掉。
+     */
+    const killAdMedia = (media) => {
+        let box = media;
+        // 最多往上走 4 层，找那个定位容器
+        for (let i = 0; i < 4 && box && box.parentNode; i++) {
+            const parent = box.parentNode;
+            if (parent === document.body || parent === document.documentElement) break;
+            let cs = null;
+            try { cs = getComputedStyle(parent); } catch (e) { /* ignore */ }
+            if (parent.nodeType === 1 && /^(DIV|ASIDE|SECTION)$/.test(parent.tagName) &&
+                cs && /fixed|absolute/.test(cs.position) &&
+                parent.offsetWidth >= 80 && parent.offsetHeight >= 50) {
+                box = parent; break;
+            }
+            box = parent;
+        }
+        if (box && box.parentNode) {
+            // 先把里面的 iframe 也停掉，别让它继续发请求
+            try {
+                const frames = box.querySelectorAll ? box.querySelectorAll('iframe') : [];
+                for (let i = 0; i < frames.length; i++) frames[i].src = 'about:blank';
+            } catch (e) { /* ignore */ }
+            box.parentNode.removeChild(box);
+            return true;
+        }
+        return false;
+    };
+
+    /**
+     * 判断一个链接是不是站内推广位。
+     * 右下角那个是**纯文字**推广（「你的回忆 · 一直都存在」）：
+     * 没有 img、没有 iframe、文案也不在 AD_TEXTS 里 —— 上一版三套判定全都漏掉它。
+     * 真正的破绽在 `href`：115 自己给投放位打了 `f=ad1` / `f=ad2` 的渠道标记。
+     */
+    const isAdAnchor = (el) => {
+        if (!el || el.nodeType !== 1) return false;
+        if (el.tagName !== 'A') return false;
+        if (el.closest('#mw-overlay, .av-overlay, .mw115-tb-slot, #mw-fab, #av-organize-fab')) return false;
+        const href = String(el.getAttribute('href') || '').toLowerCase();
+        if (!href) return false;
+        if (!AD_LINK_MARKS.some((m) => href.indexOf(m) >= 0)) return false;
+        // 得真有内容再摘 —— 空链接/占位节点不该动（防止误伤导航里的隐藏锚点）
+        const hasText = normAdText(el.textContent || '').length > 0;
+        const hasMedia = !!(el.querySelector && el.querySelector('img,iframe,video,canvas'));
+        return hasText || hasMedia;
+    };
+
+    /**
+     * 摘掉一个推广链接。
+     * 难点是「摘到哪一层为止」：<a> 外面常套一层空壳 div 负责定位，
+     * 只摘 <a> 会剩个空盒子；但无脑往上摘又会捅掉整个侧栏。
+     * 判据是**独占性** —— 父容器里除了它没有别的可见内容时，才继续往上走。
+     */
+    const killAdAnchor = (a) => {
+        let box = a;
+        for (let i = 0; i < 4 && box && box.parentNode; i++) {
+            const parent = box.parentNode;
+            if (parent === document.body || parent === document.documentElement) break;
+            if (parent.nodeType !== 1) break;
+            const kids = Array.prototype.slice.call(parent.children || []);
+            const dirty = kids.some((n) => {
+                if (n === box) return false;
+                if (normAdText(n.textContent || '').length > 0) return true;
+                return !!(n.querySelector && n.querySelector('img,iframe,button,input,svg,video'));
+            });
+            if (dirty) break;        // 父容器还装着别的东西 → 到此为止，别再往上摘
+            box = parent;
+        }
+        if (box && box.parentNode) {
+            box.parentNode.removeChild(box);
+            return true;
+        }
+        return false;
+    };
+
+    /** 关掉一个弹窗：优先点它自己的关闭按钮（这样 115 内部的「已读」状态也能同步）。 */
+    const killAdLayer = (el) => {
+        if (!el || !el.parentNode) return;
+        try {
+            const btn = el.querySelector('[aria-label*="关闭"], [title*="关闭"], [class*="close"]');
+            if (btn && typeof btn.click === 'function') { btn.click(); }
+        } catch (e) { /* ignore */ }
+        if (el.parentNode) el.parentNode.removeChild(el);
+    };
+
+    const killAds = () => {
+        if (!CFG_KILL_AD) return 0;
+        let n = 0;
+        // ① 已存在的
+        try {
+            const all = document.querySelectorAll('div,section,aside');
+            for (let i = 0; i < all.length; i++) {
+                if (isAdLayer(all[i])) { killAdLayer(all[i]); n++; }
+            }
+        } catch (e) { /* ignore */ }
+        // ①b 图片型广告位（右下角那个就是这种）
+        try {
+            const media = document.querySelectorAll('img,iframe');
+            for (let i = 0; i < media.length; i++) {
+                if (isAdMedia(media[i]) && killAdMedia(media[i])) n++;
+            }
+        } catch (e) { /* ignore */ }
+        // ①c 站内推广链接（纯文字的那种，靠 href 上的 f=ad1/f=ad2 认）
+        try {
+            const links = document.querySelectorAll(AD_LINK_SEL);
+            for (let i = 0; i < links.length; i++) {
+                if (isAdAnchor(links[i]) && killAdAnchor(links[i])) n++;
+            }
+        } catch (e) { /* ignore */ }
+        // ①d 已知 class 片段（默认为空数组 = 不启用；定位到之后填进去即可）
+        if (AD_CLASS_HINTS.length) {
+            try {
+                AD_CLASS_HINTS.forEach((sel) => {
+                    const nodes = document.querySelectorAll(sel);
+                    for (let i = 0; i < nodes.length; i++) {
+                        if (nodes[i].parentNode) { nodes[i].parentNode.removeChild(nodes[i]); n++; }
+                    }
+                });
+            } catch (e) { /* ignore */ }
+        }
+        // ② 之后新注入的
+        if (!killAds._obs && CFG_KILL_AD && window.MutationObserver) {
+            const obs = new MutationObserver((muts) => {
+                // 用户在菜单里关掉了拦截 → 立刻停观察，别继续扫 DOM
+                if (!CFG_KILL_AD) { obs.disconnect(); killAds._obs = null; return; }
+                muts.forEach((m) => {
+                    (m.addedNodes || []).forEach((node) => {
+                        if (node.nodeType !== 1) return;
+                        if (isAdLayer(node)) { killAdLayer(node); return; }
+                        // 图片广告位 / 推广链接跟浮层是几套判定，都要过一遍
+                        if (isAdMedia(node)) { killAdMedia(node); return; }
+                        if (isAdAnchor(node)) { killAdAnchor(node); return; }
+                        if (!node.querySelectorAll) return;
+                        let sub = node.querySelectorAll('div,section,aside');
+                        for (let i = 0; i < sub.length; i++) if (isAdLayer(sub[i])) killAdLayer(sub[i]);
+                        sub = node.querySelectorAll('img,iframe');
+                        for (let i = 0; i < sub.length; i++) if (isAdMedia(sub[i])) killAdMedia(sub[i]);
+                        sub = node.querySelectorAll(AD_LINK_SEL);
+                        for (let i = 0; i < sub.length; i++) if (isAdAnchor(sub[i])) killAdAnchor(sub[i]);
+                    });
+                });
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+            killAds._obs = obs;      // 存实例，关开关时能真的 disconnect
+        }
+        return n;
+    };
+
+    // 调试出口：Console 里用。广告没被清时跑 __avAd.scan() 看识别到了什么。
+    // ⚠️ 扫描会被观察器抢先摘掉一部分 —— 所以 scan() 先把观察器断开、
+    //    并临时「关掉识别开关」做一次纯诊断，跑完再恢复。
+    try {
+        window.__avAd = {
+            scan: () => {
+                const wasOn = CFG_KILL_AD;
+                if (killAds._obs) { killAds._obs.disconnect(); killAds._obs = null; }
+                CFG_KILL_AD = false;                      // 纯诊断：只认不删
+                const out = { 开关: wasOn, 识别到的浮层: [], 识别到的图片广告位: [], 识别到的推广链接: [] };
+                try {
+                    document.querySelectorAll('div,section,aside').forEach((el) => {
+                        if (!isAdLayer(el)) return;
+                        const cs = getComputedStyle(el);
+                        out.识别到的浮层.push({
+                            标签: el.tagName, 类名: String(el.className || '').slice(0, 60),
+                            位置: cs.position, 尺寸: el.offsetWidth + '×' + el.offsetHeight,
+                            命中文案: AD_TEXTS.filter((t) => normAdText(el.textContent).indexOf(t) >= 0),
+                            文本前80: normAdText(el.textContent).slice(0, 80)
+                        });
+                    });
+                } catch (e) { /* ignore */ }
+                try {
+                    document.querySelectorAll('img,iframe').forEach((el) => {
+                        if (!isAdMedia(el)) return;
+                        const addr = el.src || el.getAttribute('data-src') || '';
+                        out.识别到的图片广告位.push({
+                            标签: el.tagName, 尺寸: el.offsetWidth + '×' + el.offsetHeight,
+                            地址: addr.slice(0, 140),
+                            命中特征: AD_URL_PATTERNS.filter((p) => addr.toLowerCase().indexOf(p) >= 0),
+                            类名: String(el.className || '').slice(0, 60)
+                        });
+                    });
+                } catch (e) { /* ignore */ }
+                try {
+                    document.querySelectorAll(AD_LINK_SEL).forEach((el) => {
+                        if (!isAdAnchor(el)) return;
+                        const href = String(el.getAttribute('href') || '');
+                        out.识别到的推广链接.push({
+                            文本: normAdText(el.textContent || '').slice(0, 60),
+                            地址: href.slice(0, 140),
+                            命中标记: AD_LINK_MARKS.filter((m) => href.toLowerCase().indexOf(m) >= 0),
+                            父类名: el.parentElement ? String(el.parentElement.className || '').slice(0, 60) : '',
+                            父位置: el.parentElement ? getComputedStyle(el.parentElement).position : ''
+                        });
+                    });
+                } catch (e) { /* ignore */ }
+                CFG_KILL_AD = wasOn;                      // 恢复
+                if (wasOn) killAds();                     // 重新武装观察器
+                out.识别到的浮层数量 = out.识别到的浮层.length;
+                out.识别到的图片广告位数量 = out.识别到的图片广告位.length;
+                out.识别到的推广链接数量 = out.识别到的推广链接.length;
+                return out;
+            },
+            /** 没被认出来时，把「疑似广告」的大图/iframe 全列出来给你看 */
+            suspects: () => {
+                const list = [];
+                document.querySelectorAll('img,iframe').forEach((el) => {
+                    if (el.offsetWidth < 60 || el.offsetHeight < 40) return;
+                    list.push({
+                        标签: el.tagName, 尺寸: el.offsetWidth + '×' + el.offsetHeight,
+                        地址: (el.src || el.getAttribute('data-src') || '').slice(0, 140),
+                        类名: String(el.className || '').slice(0, 60),
+                        父类名: el.parentElement ? String(el.parentElement.className || '').slice(0, 60) : '',
+                        父位置: el.parentElement ? getComputedStyle(el.parentElement).position : ''
+                    });
+                });
+                return list;
+            },
+            kill: () => killAds(),
+            /** 列出页面上 href 带广告渠道标记的链接（不管有没有文字，先看全） */
+            links: () => {
+                const list = [];
+                document.querySelectorAll(AD_LINK_SEL).forEach((el) => {
+                    const href = String(el.getAttribute('href') || '');
+                    const low = href.toLowerCase();
+                    if (!AD_LINK_MARKS.some((m) => low.indexOf(m) >= 0)) return;
+                    list.push({
+                        文本: normAdText(el.textContent || '').slice(0, 60),
+                        地址: href.slice(0, 160),
+                        尺寸: el.offsetWidth + '×' + el.offsetHeight,
+                        父类名: el.parentElement ? String(el.parentElement.className || '').slice(0, 60) : '',
+                        父位置: el.parentElement ? getComputedStyle(el.parentElement).position : ''
+                    });
+                });
+                return list;
+            },
+            AD_TEXTS, AD_URL_PATTERNS, AD_LINK_MARKS
+        };
+    } catch (e) { /* ignore */ }
+
+    </script>
+<script>
+(function () {
+  // ⚠️ 不能直接用 body.textContent 判文案 —— 它会把内联的 <script> 源码也算进去，
+  //    而断言里写的 '你的回忆' 这几个字就在被测脚本/本段代码里，于是永远「找得到」。
+  //    （第一版就是这么挂的：7/8，唯一那条失败是测试自己坑自己。）
+  var pageText = function () {
+    var txt = '';
+    Array.prototype.forEach.call(document.body.children, function (n) {
+      if (n.tagName === 'SCRIPT') return;
+      txt += n.textContent || '';
+    });
+    return txt;
+  };
+  var out = {};
+  try {
+    killAds();
+    // 用例 1：右下角推广位，外层是个「只装它一个」的空壳 div → 整块该没
+    out['① 空壳容器被整块摘'] = !document.getElementById('case1');
+    out['① 广告文案消失'] = pageText().indexOf('你的回忆') < 0;
+    // 用例 2：侧栏里混着一个推广链接 → 只摘链接，侧栏和正常入口必须活着
+    out['② 推广链接被摘'] = !document.querySelector('#case2 a[href*="f=ad"]');
+    out['② 侧栏还在'] = !!document.getElementById('case2');
+    out['② 正常入口还在'] = pageText().indexOf('我的文件') >= 0;
+    // 用例 3：普通链接不该被动
+    out['③ 普通链接没动'] = !!document.querySelector('#case3 a');
+    // 用例 4：套了两层空壳 → 一路往上摘
+    out['④ 两层空壳一起摘'] = !document.getElementById('case4');
+    // 别把自己人也摘了
+    out['⑤ 结果面板还在'] = !!document.getElementById('result');
+  } catch (e) {
+    out['错误'] = e.message;
+  }
+  window.__RESULT = out;
+
+  var EXPECT = {
+    '① 空壳容器被整块摘': true,
+    '① 广告文案消失': true,
+    '② 推广链接被摘': true,
+    '② 侧栏还在': true,
+    '② 正常入口还在': true,
+    '③ 普通链接没动': true,
+    '④ 两层空壳一起摘': true,
+    '⑤ 结果面板还在': true
+  };
+  var pass = 0, total = 0;
+  var lines = Object.keys(out).map(function (k) {
+    var want = Object.prototype.hasOwnProperty.call(EXPECT, k) ? EXPECT[k] : undefined;
+    total++;
+    var ok = want === undefined ? true : String(want) === String(out[k]);
+    if (want !== undefined && ok) pass++;
+    return '  ' + (ok ? '<span class="ok">✔</span> ' : '<span class="bad">✘</span> ') + k + ' = ' + String(out[k]);
+  });
+  var box = document.getElementById('result');
+  if (box) box.innerHTML = '<b>广告拦截冒烟结果</b>（' + pass + '/' + total + ' 项符合预期）\n' + lines.join('\n');
+  document.title = (pass === total ? 'PASS ' : 'FAIL ') + pass + '/' + total;
+})();
+</script>
+</body></html>
