@@ -11,6 +11,63 @@
 
 ---
 
+## 115影片墙 v3.16.5（2026-10-08）
+
+### 覆盖层「只盖住文件列表区」—— 根因找到了
+
+用户反馈过两次。上一轮逐字 diff 过 `#mw-overlay` 的 CSS 和挂载点、
+和 3.15.0 完全一致，只能挂起。这次把两种可能都拿真实浏览器验了一遍，
+**两条路都能把 `position:fixed;inset:0` 打败**，而且都免疫于同一个解法：
+
+| 场景 | 普通 fixed | popover（top layer） |
+|---|---|---|
+| `body` 挂上 `transform` 后还铺满吗 | **✘ 缩水** | ✔ 仍铺满 |
+| 顶栏 `z-index:2147483647` 时谁在最上面 | ✘ 被盖住 | ✔ 覆盖层在上 |
+
+1. **包含块被改**：115 只要给 `body`/`html` 挂上 `transform` / `filter` /
+   `perspective` / `contain`（做 GPU 提升的常见写法），`position:fixed`
+   的包含块就从「视口」变成那个祖先 —— 覆盖层跟着缩水成那个祖先的尺寸，
+   看上去就是「只盖住文件列表区」。
+2. **z-index 拼不过**：115 顶栏用的是 `2147483647`（int32 上限），
+   覆盖层是 `2147483500` —— 差 147，被顶栏和侧栏盖住。
+
+**解法：进 top layer。** 用原生 `popover`（`popover="manual"` + `showPopover()`）：
+进了 top layer，**包含块恒为视口**，且优先级**高于页面上任何 z-index**，两条都免疫。
+老内核没有这套 API 就照旧退回普通 fixed（`typeof el.showPopover === 'function'` 先判一下）。
+
+样式上有两个坑，都写成测试钉住了：
+
+- `popover` 的 UA 默认样式是 `width:fit-content; margin:auto; border:solid` ——
+  不压平的话覆盖层会缩成内容大小、还跑到视口正中。
+- 我们自己的 `display:flex` **会盖掉** UA 的 `[popover]:not(:popover-open){display:none}`
+  （作者样式优先于 UA 样式）→ 必须显式补一条，
+  否则**关掉影片墙之后覆盖层还杵在页面上**。
+
+### 配套：从属浮层改挂到覆盖层内部
+
+覆盖层进了 top layer 之后，还挂在 `body` 上的设置面板 / 详情面板 / 悬停预览 /
+目标目录选择器 / toast 就**被它整个盖住，点都点不到** ——
+top layer 高于页面上一切 z-index，堆多少 z-index 都没用。
+
+新增 `layerHost()`，把这几个统一挂进 `#mw-overlay` 内部：
+top layer 里只有覆盖层一个元素，内部照常用 z-index 排序。
+
+这么改是安全的：全文件没有一条 `#mw-overlay` 的后代选择器
+（只有一条 `#mw-overlay *` 的 `box-sizing`），所以挂进去不会串样式。
+这条也写成断言钉住了。
+
+### 顺手修
+
+- 启动横幅里写死的版本号是 `3.13.2`，后面连升三个版本它都没动 ——
+  排查时看着那一行还会以为装的是旧版。改成从 `GM_info.script.version` 读了。
+- `__mw.diagLayout()` 加了两项：`topLayer`（到底进没进 top layer）、
+  `可疑祖先`（往上找第一个带 `transform`/`filter`/`contain` 的祖先，直接指出元凶）。
+
+**验证**：单测 45/45、`check.js` 0 问题、新增覆盖层冒烟 **7/7**
+（`tools/make-overlay-smoke.js`，CSS 从脚本里原样抠出，脚本改样式它跟着变）。
+
+---
+
 ## 115整理助手 v2.9.6（2026-10-08）
 
 **再关一类推广：右下角的纯文字广告位。**

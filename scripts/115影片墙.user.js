@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115影片墙
 // @namespace       cloud115.moviewall
-// @version         3.16.4
+// @version         3.16.5
 // @description     115 网盘影片墙（Emby 式）：直接读视频同目录下的海报/NFO（由本机 115 Media Hub 的「导出媒体文件」生成）；**素材实时存到本地**——NFO 原文/解析结果/海报原图自动落盘，缓存位置可选「浏览器本地」或「你自选的本机文件夹」（写成磁盘真实文件，可备份可复用），重开零请求秒出；卡片显示文件大小与码率；**新增「详情」面板**——剧情简介/标签/原名/厂牌/发行/系列/导演/时长/分级/国家/评分/数据来源 + 文件信息一屏看全（对齐 hub 的详情抽屉），卡片一行放不下的都在这里；排序支持 番号/文件名/目录/演员/类型/评分/观看日期/随机；**视图可切「海报墙 ⇄ 紧凑列表」**（列表一行一部，左侧小缩略图 + 右侧番号/标题/目录，扫番号更快，选择会记住）；勾选卡片可批量移动/删除并连带海报与 NFO，**做完原地摘卡片——不刷新页面、图不重下、滚动不跳**；**横版卡片默认用「横版高清」（-thumb/-fanart 里挑体积最大的那张：实测中位 776KB，是竖海报的 2.9 倍），可在设置里改成竖版海报或剧照；海报只有 147×200 时（约占 24%）会自动跳过糊图改用清晰图**
 // @author          cloud115.moviewall
 // @license         MIT
@@ -36,6 +36,7 @@
 // @grant           GM_registerMenuCommand
 // @grant           GM_notification
 // @grant           GM_setClipboard
+// @grant           GM_info
 // @grant           unsafeWindow
 // @run-at          document-idle
 // ==/UserScript==
@@ -299,7 +300,9 @@
             host = document.createElement('div');
             host.id = 'mw-toast-host';
             host.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:104px;z-index:2147483646;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none;';
-            (document.body || document.documentElement).appendChild(host);
+            // 挂进覆盖层：覆盖层在 top layer，普通层的 toast 会被它整个盖住。
+            // 覆盖层关掉时 host 跟着被移除，上面的 isConnected 检查会让下次重建。
+            layerHost().appendChild(host);
         }
         const el = document.createElement('div');
         const bg = type === 'error' ? 'rgba(220,38,38,.95)' : (type === 'success' ? 'rgba(21,128,61,.95)' : 'rgba(17,24,39,.92)');
@@ -3342,6 +3345,18 @@
     #mw-overlay{position:fixed;inset:0;z-index:2147483500;background:#0b0e14;color:#e6e8ee;
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
       display:flex;flex-direction:column;}
+    /* ⚠️ 光靠 position:fixed + 大 z-index 靠不住（用户实机反馈「只盖住文件列表区」）：
+         ① 115 只要给 body/html 挂上 transform/filter（GPU 提升的常见写法），
+            fixed 的包含块就从「视口」变成那个祖先 —— 覆盖层跟着缩水；
+         ② 115 顶栏用的是 z-index:2147483647（int32 上限），比这里的 2147483500 还高，
+            覆盖层会被顶栏和侧栏盖住。
+       解法是把覆盖层送进 **top layer**（原生 popover）：里面包含块恒为视口，
+       且优先级高于任何 z-index。下面这几行是把 UA 给 popover 的默认样式压平
+       （否则会是 fit-content 宽高 + margin:auto 居中 + 边框内边距）。 */
+    #mw-overlay[popover]{width:auto;height:auto;max-width:none;max-height:none;margin:0;padding:0;border:0;overflow:visible;}
+    /* 自己那条 display:flex 会盖掉 UA 的 [popover]:not(:popover-open){display:none}，
+       必须显式补回来，否则关掉之后元素还在页面上杵着。 */
+    #mw-overlay[popover]:not(:popover-open){display:none;}
     #mw-overlay *,#mw-set-overlay *{box-sizing:border-box;}
     .mw-head{display:flex;align-items:center;gap:10px;padding:11px 18px;border-bottom:1px solid #1e2532;background:#0e131b;flex-wrap:wrap;}
     .mw-logo{font-size:16px;font-weight:700;letter-spacing:.5px;background:linear-gradient(135deg,#7c5cff,#22d3ee);
@@ -3438,6 +3453,9 @@
     /* ---- 设置面板 ---- */
     #mw-set-overlay{position:fixed;inset:0;z-index:2147483620;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;}
+    /* ⚠️ 设置面板 / 详情面板 / 悬停预览 / 目标目录选择器 / toast 这些都挂在覆盖层**内部**
+       （见 layerHost()），不单独进 top layer —— top layer 里只有覆盖层一个元素，
+       内部照常用 z-index 排序。挂在 body 的话会被 top layer 的覆盖层整个盖住，点都点不到。 */
     .mw-set-panel{width:min(880px,calc(100vw - 40px));height:min(660px,calc(100vh - 60px));background:#0e131b;color:#e6e8ee;
       border:1px solid #232b39;border-radius:14px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.6);}
     .mw-set-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid #1e2532;
@@ -3904,7 +3922,7 @@
                 catch (e) { toast('复制失败：' + (e && e.message), 'error', 3200); }
             });
         });
-        document.body.appendChild(ov);
+        layerHost().appendChild(ov);
         detailEntry = entry;
         void hydrateDetailArt(ov);
     }
@@ -4124,7 +4142,7 @@
             box = document.createElement('div');
             box.id = 'mw-hover';
             box.innerHTML = '<img alt="">';
-            document.body.appendChild(box);
+            layerHost().appendChild(box);
         }
         const img = $('img', box);
         img.src = rec.c;
@@ -5485,7 +5503,7 @@
                     <button class="mw-btn primary" id="mw-set-done">完成</button>
                 </div>
             </div>`;
-        document.body.appendChild(ov);
+        layerHost().appendChild(ov);     // 挂进覆盖层内部，不然会被 top layer 的覆盖层压住
 
         let cur = (section && PANEL_SECTIONS.filter(s => s.id === section).length) ? section : PANEL_SECTIONS[0].id;
         function renderSection(id) {
@@ -5683,7 +5701,7 @@
                     <button class="mw-btn primary" id="mwd-use">就选这个目录</button>
                 </div>
             </div>`;
-        document.body.appendChild(overlay);
+        layerHost().appendChild(overlay);
 
         const listEl = overlay.querySelector('#mwd-list');
         const crumbs = overlay.querySelector('#mwd-crumbs');
@@ -5897,6 +5915,34 @@
         原来这段写在 buildOverlay 里，每重开一次墙就多一个匿名监听；而每个监听的闭包都
         留住上一棵已经 remove 掉的 overlay 树（整墙卡片 + img + 事件回调），反复开关会稳定泄漏。
         改成回调内部自己按 id 找当前 overlay，就跟 overlay 的生命周期解耦了。 */
+    /* ===== 覆盖层进 top layer =====
+       光靠 position:fixed + 大 z-index 会被 115 打败（用户实机反馈「只盖住文件列表区」）：
+       body 上挂 transform 会改掉 fixed 的包含块，顶栏的 z-index:2147483647 又比我们高。
+       原生 popover 是目前唯一「说了算」的办法：进了 top layer，包含块恒为视口，
+       优先级也高于页面上任何 z-index。老内核没有这套 API 就退回普通 fixed。 */
+    /** 从属浮层（设置/详情/悬停预览/目录选择/toast）统一挂进覆盖层内部。
+        覆盖层在 top layer 里，而 top layer 高于页面上任何 z-index ——
+        这些浮层要是还挂在 body 上，会被覆盖层整个盖住，点都点不到。
+        覆盖层不存在（比如从 115 页面上直接弹 toast）就退回 body。 */
+    function layerHost() {
+        return document.getElementById('mw-overlay') || document.body || document.documentElement;
+    }
+
+    function toTopLayer(el) {
+        if (!el || typeof el.showPopover !== 'function') return false;
+        try {
+            // manual：不参与 light dismiss，开合完全由我们自己的按钮/Escape 说了算
+            if (!el.hasAttribute('popover')) el.setAttribute('popover', 'manual');
+            if (!el.matches(':popover-open')) el.showPopover();   // 已在 top layer 时再调会抛 InvalidStateError
+            return true;
+        } catch (e) { return false; }
+    }
+    function outTopLayer(el) {
+        try {
+            if (el && typeof el.matches === 'function' && el.matches(':popover-open')) el.hidePopover();
+        } catch (e) { /* ignore */ }
+    }
+
     let mwKeysBound = false;
     function bindOverlayKeys() {
         if (mwKeysBound) return;
@@ -5963,6 +6009,7 @@
             <div class="mw-body"><div class="mw-grid" id="mw-grid"></div><div class="mw-loadmore" id="mw-loadmore"></div></div>
         `;
         document.body.appendChild(ov);
+        toTopLayer(ov);          // 进 top layer，否则会被 115 顶栏/侧栏盖住（详见 toTopLayer 注释）
 
         $$('.mw-modes button', ov).forEach((b) => {
             b.addEventListener('click', () => {
@@ -6077,7 +6124,8 @@
         hideHover();
         stopCacheLocal(true);                // 关窗就停掉后台本地化（已存下的都保留）
         const ov = $('#mw-overlay');
-        if (ov) ov.remove();
+        // remove() 本身会把元素自动弹出 top layer，这里显式再收一次做双保险
+        if (ov) { outTopLayer(ov); ov.remove(); }
         state.overlayOpen = false;
         dropPosterObserver();                        // overlay 整棵树都要丢，观察目标更不能留着
         clearCoverBlobs();
@@ -6254,6 +6302,24 @@
                     覆盖层实际: Math.round(r.width) + '×' + Math.round(r.height) + ' @ ' + Math.round(r.left) + ',' + Math.round(r.top),
                     铺满视口: Math.round(r.width) === win.w && Math.round(r.height) === win.h,
                     position: cs.position, zIndex: cs.zIndex, display: cs.display,
+                    topLayer: (() => {
+                        try { return ov.matches(':popover-open') ? '在（popover）' : '不在'; }
+                        catch (e) { return '内核不支持 popover'; }
+                    })(),
+                    // fixed 的包含块会被祖先的 transform/filter/perspective/contain 改掉 ——
+                    // 「只盖住文件列表区」就是它干的。这里把元凶直接指出来。
+                    可疑祖先: (() => {
+                        let p = ov.parentElement;
+                        while (p && p !== document.documentElement) {
+                            const s = getComputedStyle(p);
+                            if (s.transform !== 'none' || s.filter !== 'none' || s.perspective !== 'none' ||
+                                /paint|layout|strict|content/.test(s.contain)) {
+                                return p.tagName + (p.id ? '#' + p.id : '') + ' transform=' + s.transform;
+                            }
+                            p = p.parentElement;
+                        }
+                        return '无（正常）';
+                    })(),
                     父节点: ov.parentElement ? (ov.parentElement.tagName + (ov.parentElement.id ? '#' + ov.parentElement.id : '')) : '(无)',
                     挂在body下: ov.parentElement === document.body,
                     挡住它的元素: blockers,
@@ -6267,5 +6333,10 @@
         console.error('[115影片墙] 调试出口挂载失败（不影响主功能）:', e && e.message);
     }
 
-    console.log('[115影片墙] v3.13.2 已加载（横版卡片默认用「横版高清」＝ -thumb/-fanart 里挑最大的那张；海报太小会自动换清晰图）');
+    // 启动横幅的版本号从 @version 读，别写死 —— 这里曾经写死成 3.13.2，
+    // 后来连升三个版本它一直没动，排查时看着那一行还以为装的是旧版。
+    let MW_VER = '3.16.5';
+    try { if (typeof GM_info !== 'undefined' && GM_info.script) MW_VER = GM_info.script.version || MW_VER; }
+    catch (e) { /* ignore */ }
+    console.log('[115影片墙] v' + MW_VER + ' 已加载（横版卡片默认用「横版高清」＝ -thumb/-fanart 里挑最大的那张；海报太小会自动换清晰图）');
 })();
