@@ -934,6 +934,31 @@ test('整理助手：默认拦截 115 广告弹窗，且可关闭', () => {
   assert.ok(/GM_registerMenuCommand[\s\S]{0,200}广告/.test(src), '应有菜单开关');
 });
 
+test('整理助手：图片型广告位也拦（右下角那个，v2.9.5）', () => {
+  const src = readScript('115整理助手.user.js');
+  // 上一版只认文案型浮层，右下角那个是图片素材 → 一句文案都命中不了
+  assert.ok(/const AD_URL_PATTERNS = \[/.test(src), '缺按地址识别的广告片段表');
+  assert.ok(/const isAdMedia = \(el\)/.test(src), '缺 isAdMedia');
+  assert.ok(/const killAdMedia = \(media\)/.test(src), '缺 killAdMedia');
+  // 不能只 removeChild(img) —— 那样留个空洞。必须往上找定位容器整块摘
+  const kill = src.slice(src.indexOf('const killAdMedia'));
+  const killBody = kill.slice(0, kill.indexOf("const killAdLayer"));
+  assert.ok(/parentNode\.removeChild/.test(killBody), '应摘除容器');
+  assert.ok(/position/.test(killBody), '应往上找负责定位的容器');
+  assert.ok(/about:blank/.test(killBody), '摘之前应停掉 iframe，别让它继续发请求');
+  // 尺寸门槛：不能把小图标/头像摘了
+  const isAd = src.slice(src.indexOf('const isAdMedia'));
+  const isAdBody = isAd.slice(0, isAd.indexOf('const killAdMedia'));
+  assert.ok(/offsetWidth >= 80 && el\.offsetHeight >= 50/.test(isAdBody), '图片应有尺寸门槛');
+  // 观察器两套判定都要过
+  assert.ok(/isAdMedia\(node\)/.test(src), '观察器也应处理新插入的广告图片');
+  // 未实测的 class 片段默认不启用（乱写 selector 误杀代价大）
+  assert.ok(/const AD_CLASS_HINTS = \[\];/.test(src), 'AD_CLASS_HINTS 应默认为空数组');
+  // 调试出口
+  assert.ok(/__avAd/.test(src), '缺 __avAd 调试出口');
+  assert.ok(/suspects:/.test(src), '__avAd 应有 suspects（列出未被认出的疑似广告）');
+});
+
 test('整理助手：13 项动作都进了工具栏下拉', () => {
   const src = readScript('115整理助手.user.js');
   const labels = [

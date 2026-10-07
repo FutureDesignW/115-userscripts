@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115整理助手 (115Rename2026 + 递归整理)
 // @namespace       https://github.com/liuchanghuaX1/115Rename2026
-// @version         2.9.4
+// @version         2.9.5
 // @description     在 115Rename2026 基础上整合「递归整理」：递归扫描当前目录及全部子目录 → 去掉文件名里的干扰词 → 抽取番号 → 视频汇总到当前目录 → 按所选「重命名方式」改名（本地优先，缺信息的条目才联网） → 清空已空的子目录。重命名方式 7 种可选，并支持**在整理预览面板里就地自定义模板**（`{code}{title}{actress}{date}{rating}{markers}` 变量按钮、实时重算、不联网）。改名后可在菜单里**一键撤销上次改名**。
 // @author          sonarlee (原始引擎) + 递归整理整合
 // @include         https://115.com/*
@@ -4158,7 +4158,7 @@
         };
     } catch (e) { /* ignore */ }
 
-    console.log('115整理助手 v2.9.4 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
+    console.log('115整理助手 v2.9.5 加载完成（115Rename2026 引擎 + 本地优先整理 + 干扰词自学习 + 自定义命名模板 + 改名回滚 + 入口挂到 115 顶部工具栏）');
     /* ===== 入口：挂到 115 顶部工具栏（找不到才退回右下角悬浮球） =====
        工具栏下拉里的 13 项与右键菜单（第 22 节 rename_list）一一对应 ——
        两处共用同一批函数，右键菜单保留不动，当作工具栏挂不上时的第二条路。
@@ -4235,23 +4235,35 @@
     })();
 
     /* ========================================================================
-     * 24. 关掉 115 的推广弹窗（默认开启，可在菜单里关）
+     * 24. 关掉 115 的推广（默认开启，可在菜单里关）
      *
-     * 用户实机反馈：进网盘就被「NEW 重磅升级 / VIP专享权益」弹窗糊脸，
-     * 挡着内容还带营销链接。
+     * 用户实机反馈两类：
+     *   a) 进网盘就被「NEW 重磅升级 / VIP专享权益」弹窗糊脸（居中浮层）
+     *   b) 右下角常驻一个广告位（图片素材，挂在页面流里）
      *
-     * 识别用「文案特征」而不是 class/id —— 115 的 class 是构建产物、每次发版都在变，
-     * 这跟工具栏定位踩过的是同一个坑。文案（VIP专享权益 / 了解更多 / 重磅升级）
-     * 是投放素材里写死的，稳定得多。
+     * 识别用「文案特征 + 素材来源」而不是 class/id —— 115 的 class 是构建产物、
+     * 每次发版都在变，这跟工具栏定位踩过的是同一个坑。
      *
-     * 两道保险（任一命中即关）：
-     *   ① 扫描已存在的浮层：文案特征命中 ≥2 句 + 是 fixed/absolute 浮层 + 带关闭按钮 → 点它自己的关闭按钮再摘掉
-     *   ② MutationObserver 盯着新插入的节点（弹窗是延迟注入的，页面加载完才有）
+     * 三类判定（任一命中即处理）：
+     *   ① 文案型浮层：命中 ≥2 句文案 + fixed/absolute + 带关闭按钮 → 点它自己的关闭按钮再摘除
+     *   ② 图片广告位：<img>/<iframe> 的地址或 alt 命中广告域名特征 → 摘掉它最近的定位容器
+     *   ③ 兜底扫除：115 已知的广告容器 class 片段（留了但默认不启用，见 AD_CLASS_HINTS 注释）
+     *
+     * 另有 MutationObserver 盯新插入的节点（弹窗是延迟注入的，页面加载完才有）。
      * ======================================================================== */
 
     const AD_SWITCH_KEY = 'kill115Ad';
     // 投放素材里的固定文案 —— 换一批（class 会变，这些不会）
     const AD_TEXTS = ['VIP专享权益', '重磅升级', '了解更多', '立即升级', '限时特惠', '开通会员'];
+    // 图片型广告的地址特征（右下角那个广告位靠这个认：它是图片，不是文字）
+    const AD_URL_PATTERNS = [
+        '115cdn.com/ad', 'ad.115', 'adimg.115', '115.com/ad',
+        'advert', 'promotion', 'tanx.com', 'alimama', 'baidu.com/ad',
+        'gdt.qq.com', 'mmstat.com', 'doubleclick', 'adservice'
+    ];
+    // ⚠️ 115 的广告容器 class 目前没实测到（不敢乱写，误伤代价大）。
+    //    定位到之后填这里即可生效；留空数组 = 不启用这条判定。
+    const AD_CLASS_HINTS = [];
     // 开关状态（默认开启）。⚠️ 必须声明在 killAds 之前 —— let 有 TDZ，
     // 「声明和使用顺序反了」这类错在小脚本里很难一眼看出来。
     let CFG_KILL_AD = GM_getValue(AD_SWITCH_KEY, true);
@@ -4277,6 +4289,62 @@
     };
     const normAdText = (s) => String(s || '').replace(/\s+/g, '');
 
+    /**
+     * 判断一个媒体元素（img/iframe）是不是广告素材。
+     * 右下角那个广告位是**图片**，文案特征一点都命中不了 —— 只能看地址。
+     */
+    const isAdMedia = (el) => {
+        if (!el || el.nodeType !== 1) return false;
+        const tag = el.tagName;
+        if (tag !== 'IMG' && tag !== 'IFRAME') return false;
+        if (el.closest('#mw-overlay, .av-overlay')) return false;
+        // 尺寸门槛：小图标、头像、表情不该被摘
+        if (tag === 'IMG' && !(el.offsetWidth >= 80 && el.offsetHeight >= 50)) return false;
+        // src / data-src / alt / 祖先 href 一起看 —— 广告常把真实地址放 data-* 上
+        let bits = [
+            el.src || '', el.getAttribute('data-src') || '', el.getAttribute('data-original') || '',
+            el.getAttribute('alt') || '', el.getAttribute('title') || ''
+        ].join(' ').toLowerCase();
+        try {
+            const a = el.closest ? el.closest('a') : null;
+            if (a) bits += ' ' + (a.href || '');
+        } catch (e) { /* ignore */ }
+        if (!bits) return false;
+        return AD_URL_PATTERNS.some((p) => bits.indexOf(p) >= 0);
+    };
+
+    /**
+     * 摘掉广告素材。
+     * ⚠️ 不能只 removeChild(img) —— 那样留个空洞，页面看着更怪。
+     *    往上找到「负责定位的那个容器」（fixed/absolute 且有尺寸）一起摘掉。
+     */
+    const killAdMedia = (media) => {
+        let box = media;
+        // 最多往上走 4 层，找那个定位容器
+        for (let i = 0; i < 4 && box && box.parentNode; i++) {
+            const parent = box.parentNode;
+            if (parent === document.body || parent === document.documentElement) break;
+            let cs = null;
+            try { cs = getComputedStyle(parent); } catch (e) { /* ignore */ }
+            if (parent.nodeType === 1 && /^(DIV|ASIDE|SECTION)$/.test(parent.tagName) &&
+                cs && /fixed|absolute/.test(cs.position) &&
+                parent.offsetWidth >= 80 && parent.offsetHeight >= 50) {
+                box = parent; break;
+            }
+            box = parent;
+        }
+        if (box && box.parentNode) {
+            // 先把里面的 iframe 也停掉，别让它继续发请求
+            try {
+                const frames = box.querySelectorAll ? box.querySelectorAll('iframe') : [];
+                for (let i = 0; i < frames.length; i++) frames[i].src = 'about:blank';
+            } catch (e) { /* ignore */ }
+            box.parentNode.removeChild(box);
+            return true;
+        }
+        return false;
+    };
+
     /** 关掉一个弹窗：优先点它自己的关闭按钮（这样 115 内部的「已读」状态也能同步）。 */
     const killAdLayer = (el) => {
         if (!el || !el.parentNode) return;
@@ -4297,6 +4365,24 @@
                 if (isAdLayer(all[i])) { killAdLayer(all[i]); n++; }
             }
         } catch (e) { /* ignore */ }
+        // ①b 图片型广告位（右下角那个就是这种）
+        try {
+            const media = document.querySelectorAll('img,iframe');
+            for (let i = 0; i < media.length; i++) {
+                if (isAdMedia(media[i]) && killAdMedia(media[i])) n++;
+            }
+        } catch (e) { /* ignore */ }
+        // ①c 已知 class 片段（默认为空数组 = 不启用；定位到之后填进去即可）
+        if (AD_CLASS_HINTS.length) {
+            try {
+                AD_CLASS_HINTS.forEach((sel) => {
+                    const nodes = document.querySelectorAll(sel);
+                    for (let i = 0; i < nodes.length; i++) {
+                        if (nodes[i].parentNode) { nodes[i].parentNode.removeChild(nodes[i]); n++; }
+                    }
+                });
+            } catch (e) { /* ignore */ }
+        }
         // ② 之后新注入的
         if (!killAds._obs && CFG_KILL_AD && window.MutationObserver) {
             const obs = new MutationObserver((muts) => {
@@ -4304,11 +4390,15 @@
                 if (!CFG_KILL_AD) { obs.disconnect(); killAds._obs = null; return; }
                 muts.forEach((m) => {
                     (m.addedNodes || []).forEach((node) => {
-                        if (isAdLayer(node)) killAdLayer(node);
-                        else if (node.querySelectorAll) {
-                            const sub = node.querySelectorAll('div,section,aside');
-                            for (let i = 0; i < sub.length; i++) if (isAdLayer(sub[i])) killAdLayer(sub[i]);
-                        }
+                        if (node.nodeType !== 1) return;
+                        if (isAdLayer(node)) { killAdLayer(node); return; }
+                        // 图片/iframe 广告位跟浮层是两套判定，都要过一遍
+                        if (isAdMedia(node)) { killAdMedia(node); return; }
+                        if (!node.querySelectorAll) return;
+                        let sub = node.querySelectorAll('div,section,aside');
+                        for (let i = 0; i < sub.length; i++) if (isAdLayer(sub[i])) killAdLayer(sub[i]);
+                        sub = node.querySelectorAll('img,iframe');
+                        for (let i = 0; i < sub.length; i++) if (isAdMedia(sub[i])) killAdMedia(sub[i]);
                     });
                 });
             });
@@ -4317,6 +4407,66 @@
         }
         return n;
     };
+
+    // 调试出口：Console 里用。广告没被清时跑 __avAd.scan() 看识别到了什么。
+    // ⚠️ 扫描会被观察器抢先摘掉一部分 —— 所以 scan() 先把观察器断开、
+    //    并临时「关掉识别开关」做一次纯诊断，跑完再恢复。
+    try {
+        window.__avAd = {
+            scan: () => {
+                const wasOn = CFG_KILL_AD;
+                if (killAds._obs) { killAds._obs.disconnect(); killAds._obs = null; }
+                CFG_KILL_AD = false;                      // 纯诊断：只认不删
+                const out = { 开关: wasOn, 识别到的浮层: [], 识别到的图片广告位: [], 全部广告: [] };
+                try {
+                    document.querySelectorAll('div,section,aside').forEach((el) => {
+                        if (!isAdLayer(el)) return;
+                        const cs = getComputedStyle(el);
+                        out.识别到的浮层.push({
+                            标签: el.tagName, 类名: String(el.className || '').slice(0, 60),
+                            位置: cs.position, 尺寸: el.offsetWidth + '×' + el.offsetHeight,
+                            命中文案: AD_TEXTS.filter((t) => normAdText(el.textContent).indexOf(t) >= 0),
+                            文本前80: normAdText(el.textContent).slice(0, 80)
+                        });
+                    });
+                } catch (e) { /* ignore */ }
+                try {
+                    document.querySelectorAll('img,iframe').forEach((el) => {
+                        if (!isAdMedia(el)) return;
+                        const addr = el.src || el.getAttribute('data-src') || '';
+                        out.识别到的图片广告位.push({
+                            标签: el.tagName, 尺寸: el.offsetWidth + '×' + el.offsetHeight,
+                            地址: addr.slice(0, 140),
+                            命中特征: AD_URL_PATTERNS.filter((p) => addr.toLowerCase().indexOf(p) >= 0),
+                            类名: String(el.className || '').slice(0, 60)
+                        });
+                    });
+                } catch (e) { /* ignore */ }
+                CFG_KILL_AD = wasOn;                      // 恢复
+                if (wasOn) killAds();                     // 重新武装观察器
+                out.识别到的浮层数量 = out.识别到的浮层.length;
+                out.识别到的图片广告位数量 = out.识别到的图片广告位.length;
+                return out;
+            },
+            /** 没被认出来时，把「疑似广告」的大图/iframe 全列出来给你看 */
+            suspects: () => {
+                const list = [];
+                document.querySelectorAll('img,iframe').forEach((el) => {
+                    if (el.offsetWidth < 60 || el.offsetHeight < 40) return;
+                    list.push({
+                        标签: el.tagName, 尺寸: el.offsetWidth + '×' + el.offsetHeight,
+                        地址: (el.src || el.getAttribute('data-src') || '').slice(0, 140),
+                        类名: String(el.className || '').slice(0, 60),
+                        父类名: el.parentElement ? String(el.parentElement.className || '').slice(0, 60) : '',
+                        父位置: el.parentElement ? getComputedStyle(el.parentElement).position : ''
+                    });
+                });
+                return list;
+            },
+            kill: () => killAds(),
+            AD_TEXTS, AD_URL_PATTERNS
+        };
+    } catch (e) { /* ignore */ }
 
     // 弹窗是延迟注入的：一开就扫 + 之后持续盯
     if (CFG_KILL_AD) {
