@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name            115影片墙
 // @namespace       cloud115.moviewall
-// @version         3.16.5
+// @version         3.16.6
 // @description     115 网盘影片墙（Emby 式）：直接读视频同目录下的海报/NFO（由本机 115 Media Hub 的「导出媒体文件」生成）；**素材实时存到本地**——NFO 原文/解析结果/海报原图自动落盘，缓存位置可选「浏览器本地」或「你自选的本机文件夹」（写成磁盘真实文件，可备份可复用），重开零请求秒出；卡片显示文件大小与码率；**新增「详情」面板**——剧情简介/标签/原名/厂牌/发行/系列/导演/时长/分级/国家/评分/数据来源 + 文件信息一屏看全（对齐 hub 的详情抽屉），卡片一行放不下的都在这里；排序支持 番号/文件名/目录/演员/类型/评分/观看日期/随机；**视图可切「海报墙 ⇄ 紧凑列表」**（列表一行一部，左侧小缩略图 + 右侧番号/标题/目录，扫番号更快，选择会记住）；勾选卡片可批量移动/删除并连带海报与 NFO，**做完原地摘卡片——不刷新页面、图不重下、滚动不跳**；**横版卡片默认用「横版高清」（-thumb/-fanart 里挑体积最大的那张：实测中位 776KB，是竖海报的 2.9 倍），可在设置里改成竖版海报或剧照；海报只有 147×200 时（约占 24%）会自动跳过糊图改用清晰图**
 // @author          cloud115.moviewall
 // @license         MIT
@@ -3346,17 +3346,21 @@
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
       display:flex;flex-direction:column;}
     /* ⚠️ 光靠 position:fixed + 大 z-index 靠不住（用户实机反馈「只盖住文件列表区」）：
-         ① 115 只要给 body/html 挂上 transform/filter（GPU 提升的常见写法），
+         ① 115 只要给 body/某个容器挂上 transform/filter（GPU 提升、切换动画都会用），
             fixed 的包含块就从「视口」变成那个祖先 —— 覆盖层跟着缩水；
          ② 115 顶栏用的是 z-index:2147483647（int32 上限），比这里的 2147483500 还高，
             覆盖层会被顶栏和侧栏盖住。
-       解法是把覆盖层送进 **top layer**（原生 popover）：里面包含块恒为视口，
+       首选解法是把覆盖层送进 **top layer**（原生 popover）：里面包含块恒为视口，
        且优先级高于任何 z-index。下面这几行是把 UA 给 popover 的默认样式压平
        （否则会是 fit-content 宽高 + margin:auto 居中 + 边框内边距）。 */
     #mw-overlay[popover]{width:auto;height:auto;max-width:none;max-height:none;margin:0;padding:0;border:0;overflow:visible;}
     /* 自己那条 display:flex 会盖掉 UA 的 [popover]:not(:popover-open){display:none}，
        必须显式补回来，否则关掉之后元素还在页面上杵着。 */
     #mw-overlay[popover]:not(:popover-open){display:none;}
+    /* 进不去 top layer 时的兜底：退回普通 fixed，坐标由 fitViewport() 按包含块反算
+       （内联 left/top/宽高，见脚本里的 fitViewport）。z-index 顶到 int32 上限，
+       跟 115 顶栏同值 —— 同值看 DOM 顺序，我们的元素是 body 的最后一个子节点，还是我们赢。 */
+    #mw-overlay.mw-nolayer{z-index:2147483647;}
     #mw-overlay *,#mw-set-overlay *{box-sizing:border-box;}
     .mw-head{display:flex;align-items:center;gap:10px;padding:11px 18px;border-bottom:1px solid #1e2532;background:#0e131b;flex-wrap:wrap;}
     .mw-logo{font-size:16px;font-weight:700;letter-spacing:.5px;background:linear-gradient(135deg,#7c5cff,#22d3ee);
@@ -5915,11 +5919,17 @@
         原来这段写在 buildOverlay 里，每重开一次墙就多一个匿名监听；而每个监听的闭包都
         留住上一棵已经 remove 掉的 overlay 树（整墙卡片 + img + 事件回调），反复开关会稳定泄漏。
         改成回调内部自己按 id 找当前 overlay，就跟 overlay 的生命周期解耦了。 */
-    /* ===== 覆盖层进 top layer =====
+    /* ===== 覆盖层「站对位置」 =====
        光靠 position:fixed + 大 z-index 会被 115 打败（用户实机反馈「只盖住文件列表区」）：
-       body 上挂 transform 会改掉 fixed 的包含块，顶栏的 z-index:2147483647 又比我们高。
-       原生 popover 是目前唯一「说了算」的办法：进了 top layer，包含块恒为视口，
-       优先级也高于页面上任何 z-index。老内核没有这套 API 就退回普通 fixed。 */
+         ① 祖先挂上 transform/filter 会改掉 fixed 的包含块 → 覆盖层缩水成那个祖先的尺寸；
+         ② 115 顶栏的 z-index:2147483647（int32 上限）比覆盖层的 2147483500 高 → 被盖住。
+       top layer（原生 popover）两条都免疫，但它**不是设一次就永远有效** ——
+       用户补了一句关键信息：重装后第一次是好的、刷新一次就坏，说明这跟页面运行期状态有关。
+       所以不赌单点，三层保险：
+         ① 首选 popover 进 top layer；
+         ② 进不去就退回普通 fixed，但把坐标按包含块反算（fitViewport）+ .mw-nolayer 顶 z-index；
+         ③ 常驻看门人（1.2s + resize/scroll）复核，布局变了就重来一次。
+       判定一律用「实际量出来的矩形是否铺满视口」，不信任任何 API 的自我报告。 */
     /** 从属浮层（设置/详情/悬停预览/目录选择/toast）统一挂进覆盖层内部。
         覆盖层在 top layer 里，而 top layer 高于页面上任何 z-index ——
         这些浮层要是还挂在 body 上，会被覆盖层整个盖住，点都点不到。
@@ -5928,19 +5938,163 @@
         return document.getElementById('mw-overlay') || document.body || document.documentElement;
     }
 
+    /** 覆盖层在不在 top layer 里 → 'open' | 'closed' | 'unsupported' */
+    function topLayerState(el) {
+        if (!el) return 'closed';
+        if (typeof el.showPopover !== 'function') return 'unsupported';
+        try { return el.matches(':popover-open') ? 'open' : 'closed'; }
+        catch (e) { return 'unsupported'; }        // 选择器都不认识，就当这内核没这套
+    }
+
+    /** 视口尺寸。用 clientWidth 兜底：有滚动条时 innerWidth 会含滚动条宽度，
+        而 fixed/popover 的 inset:0 是按不含滚动条的含块算的。 */
+    function vpSize() {
+        const de = document.documentElement || {};
+        return {
+            w: Math.max(innerWidth || 0, de.clientWidth || 0),
+            h: Math.max(innerHeight || 0, de.clientHeight || 0)
+        };
+    }
+
+    /** 覆盖层现在真的铺满视口了吗？—— 直接量，不问 API。
+        统一以「量出来的矩形」为准，是因为 API 的报告可能对不上实际渲染。 */
+    function layerCoversViewport(el) {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const v = vpSize();
+        return r.width >= v.w - 2 && r.height >= v.h - 2 && r.left <= 1 && r.top <= 1;
+    }
+
+    /** 进 top layer。永不抛异常；失败原因原样带出来，好写进 Console 和自检面板。 */
     function toTopLayer(el) {
-        if (!el || typeof el.showPopover !== 'function') return false;
+        if (!el) return { ok: false, error: '元素不存在' };
+        if (typeof el.showPopover !== 'function') return { ok: false, error: '内核不支持 popover（没有 showPopover）' };
         try {
             // manual：不参与 light dismiss，开合完全由我们自己的按钮/Escape 说了算
             if (!el.hasAttribute('popover')) el.setAttribute('popover', 'manual');
-            if (!el.matches(':popover-open')) el.showPopover();   // 已在 top layer 时再调会抛 InvalidStateError
-            return true;
-        } catch (e) { return false; }
+        } catch (e) {
+            return { ok: false, error: '设置 popover 属性失败：' + (e && e.message) };
+        }
+        // :popover-open 单独 try —— 万一选择器不被认识，也不能连累 showPopover 不被调用
+        let already = false;
+        try { already = !!el.matches(':popover-open'); } catch (e) { /* 选择器不支持 */ }
+        if (!already) {
+            try { el.showPopover(); }
+            catch (e) { return { ok: false, error: 'showPopover 抛错：' + (e && e.message) }; }
+        }
+        let open = true;
+        try { open = !!el.matches(':popover-open'); } catch (e) { /* 选择器不支持就默认相信 */ }
+        return { ok: open, error: open ? '' : 'showPopover 调了但没进 top layer' };
     }
     function outTopLayer(el) {
         try {
             if (el && typeof el.matches === 'function' && el.matches(':popover-open')) el.hidePopover();
         } catch (e) { /* ignore */ }
+    }
+
+    /** 进不去 top layer 时的兜底：按「实际包含块」把覆盖层的坐标反算一遍。
+        做法是先把它摆成坐标系原点上的 1px 方块，量出这个「本地 0,0」落在视口的哪里、
+        以及缩放比 —— 祖先的 transform 会同时改这两样，两个都量到就能反解。
+        然后把 left/top/宽高按视口尺寸写回去。translate + scale 都能被精确抵消，
+        跟祖先具体怎么 transform 无关（这套只处理仿射变换，旋转不在考虑内）。 */
+    function fitViewport(el) {
+        if (!el) return;
+        const st = el.style;
+        st.left = '0px'; st.top = '0px'; st.right = 'auto'; st.bottom = 'auto';
+        st.margin = '0'; st.width = '1px'; st.height = '1px';
+        const r = el.getBoundingClientRect();       // 会强制一次布局，量到的才是真实结果
+        const sx = r.width || 1, sy = r.height || 1; // 本地 1px 在视口里是多少 px
+        const v = vpSize();
+        st.left = (-r.left / sx) + 'px';
+        st.top = (-r.top / sy) + 'px';
+        st.width = (v.w / sx) + 'px';
+        st.height = (v.h / sy) + 'px';
+    }
+    /** 清掉 fitViewport 写的内联坐标（进了 top layer 就还给它 inset:0）。 */
+    function clearFit(el) {
+        if (!el || !el.style) return;
+        ['left', 'top', 'right', 'bottom', 'width', 'height', 'margin']
+            .forEach((k) => el.style.removeProperty(k));
+    }
+
+    let layerMode = '-';        // 'top-layer' | 'fixed+fit' | '-'
+    let layerError = '';        // 走兜底时的原因，给自检面板看
+
+    /** 让覆盖层站对位置。幂等：已经铺满就什么都不做，可以反复调。 */
+    function ensureOverlayTopLayer(ov) {
+        if (!ov) return;
+        // 已经定下走兜底的，就别再反复折腾 popover 了 ——
+        // 「设属性 → showPopover 失败 → 摘属性」来回折腾会让覆盖层闪一下（属性在、又没 open
+        // 的时候命中 :not(:popover-open){display:none}）。兜底模式只需重算坐标。
+        if (ov.__mwFitMode) { fitViewport(ov); return; }
+
+        const res = toTopLayer(ov);
+        if (res.ok && layerCoversViewport(ov)) {
+            clearFit(ov);
+            ov.classList.remove('mw-nolayer');
+            layerMode = 'top-layer'; layerError = '';
+            return;
+        }
+        // 退回普通 fixed。⚠️ 必须把 popover 属性摘掉：留着它而元素又不是 open 状态，
+        // 自己那条 [popover]:not(:popover-open){display:none} 会把覆盖层整个藏起来
+        // （showPopover 抛错时就会落到这里，属性已经设上了）。
+        try { ov.removeAttribute('popover'); } catch (e) { /* ignore */ }
+        ov.__mwFitMode = true;
+        ov.classList.add('mw-nolayer');
+        clearFit(ov);                 // 先清干净再量，免得量到上一轮的补偿值
+        fitViewport(ov);
+        layerMode = 'fixed+fit';
+        layerError = res.error || '在 top layer 里但没铺满视口';
+        if (!res.ok) {
+            console.warn('[115影片墙] 覆盖层没能进 top layer（' + res.error + '）—— 已改用坐标补偿兜底。' +
+                '如果画面还是不对，油猴菜单里点「诊断：覆盖层铺不满」把结果发我');
+        }
+        if (!layerCoversViewport(ov)) layerError += ' ｜ 坐标补偿后仍未铺满（可能在别的文档上下文里）';
+    }
+
+    /* 看门人：布局变了（115 后挂 transform、窗口缩放、滚动、SPA 切页）会重算。
+       不能在挂载时算一次就完事 —— 用户反馈「装完第一次是好的，刷新一次就坏」，
+       就是典型的「运行期状态变了」而不是「CSS 写错」。 */
+    const LAYER_POLL_MS = 1200;
+    let layerTimer = null;
+    let layerWatchBound = false;
+    let layerTick = 0;
+    let relayoutRaf = 0;
+
+    function relayoutOverlay() {
+        if (relayoutRaf) return;
+        relayoutRaf = requestAnimationFrame(() => {
+            relayoutRaf = 0;
+            const ov = document.getElementById('mw-overlay');
+            if (!ov) return;
+            // top layer 里包含块恒为视口，不用跟着重算
+            if (topLayerState(ov) === 'open') return;
+            fitViewport(ov);
+        });
+    }
+    function startLayerWatch() {
+        if (!layerWatchBound) {
+            layerWatchBound = true;
+            window.addEventListener('resize', relayoutOverlay);
+            document.addEventListener('scroll', relayoutOverlay, { capture: true, passive: true });
+        }
+        if (layerTimer) return;
+        layerTimer = setInterval(() => {
+            const ov = document.getElementById('mw-overlay');
+            if (!ov) { stopLayerWatch(); return; }
+            // 在 top layer 里就只读一个布尔值，不给滚动和渲染添乱（量矩形会强制布局）
+            if (topLayerState(ov) === 'open') return;
+            // 兜底模式：只跟着重算坐标，约 6s 一次
+            if (ov.__mwFitMode) {
+                if (++layerTick % 5 === 0) fitViewport(ov);
+                return;
+            }
+            // 之前进过 top layer、现在丢了（被谁收起了 / 属性被清了）→ 重新挂
+            ensureOverlayTopLayer(ov);
+        }, LAYER_POLL_MS);
+    }
+    function stopLayerWatch() {
+        if (layerTimer) { clearInterval(layerTimer); layerTimer = null; }
     }
 
     let mwKeysBound = false;
@@ -6009,7 +6163,8 @@
             <div class="mw-body"><div class="mw-grid" id="mw-grid"></div><div class="mw-loadmore" id="mw-loadmore"></div></div>
         `;
         document.body.appendChild(ov);
-        toTopLayer(ov);          // 进 top layer，否则会被 115 顶栏/侧栏盖住（详见 toTopLayer 注释）
+        ensureOverlayTopLayer(ov);   // 进 top layer；进不去就按包含块反算坐标（见上面那段）
+        startLayerWatch();           // 115 有可能在我们之后才给容器加 transform，得盯着
 
         $$('.mw-modes button', ov).forEach((b) => {
             b.addEventListener('click', () => {
@@ -6123,6 +6278,7 @@
     function closeOverlay() {
         hideHover();
         stopCacheLocal(true);                // 关窗就停掉后台本地化（已存下的都保留）
+        stopLayerWatch();
         const ov = $('#mw-overlay');
         // remove() 本身会把元素自动弹出 top layer，这里显式再收一次做双保险
         if (ov) { outTopLayer(ov); ov.remove(); }
@@ -6197,6 +6353,50 @@
         }, 300);
     })();
 
+    /** 把布局自检的结果直接显示在页面上，带「复制」。
+        为什么不做成只在 Console 跑：不是每个人都会开 F12 —— 走油猴菜单一步就能看到，
+        出问题时截个图发回来就行。 */
+    function showLayerDiag() {
+        const ov = document.getElementById('mw-overlay');
+        const data = (window.__mw && window.__mw.diagLayout)
+            ? window.__mw.diagLayout()
+            : { 提示: '调试出口不可用（window.__mw 没挂上）' };
+        const text = JSON.stringify(data, null, 2);
+        const old = document.getElementById('mw-diag-box');
+        if (old) old.remove();
+        const box = document.createElement('div');
+        box.id = 'mw-diag-box';
+        box.style.cssText = 'background:#0e131b;color:#dbe2ee;border:1px solid #2a3446;border-radius:10px;' +
+            'padding:16px;display:flex;flex-direction:column;gap:10px;z-index:2147483647;' +
+            'font-family:ui-monospace,Consolas,Menlo,monospace;font-size:12px;' +
+            (ov ? 'position:absolute;inset:0;' : 'position:fixed;left:24px;right:24px;top:24px;bottom:24px;');
+        const pre = document.createElement('pre');
+        pre.style.cssText = 'flex:1;overflow:auto;margin:0;white-space:pre-wrap;word-break:break-all;';
+        pre.textContent = text;
+        const bar = document.createElement('div');
+        bar.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;';
+        const mkBtn = (label, fn) => {
+            const b = document.createElement('button');
+            b.className = 'mw-btn'; b.textContent = label; b.addEventListener('click', fn);
+            return b;
+        };
+        bar.appendChild(mkBtn('复制', () => {
+            try { GM_setClipboard(text); toast('诊断信息已复制', 'success', 2000); }
+            catch (e) { toast('复制失败，手动选中文本吧', 'error', 2500); }
+        }));
+        bar.appendChild(mkBtn('重算覆盖层', () => {
+            const o = document.getElementById('mw-overlay');
+            if (!o) { toast('先打开影片墙再点这个', 'info', 2500); return; }
+            ensureOverlayTopLayer(o);
+            toast('已重算：' + layerMode, 'success', 2500);
+            box.remove(); showLayerDiag();
+        }));
+        bar.appendChild(mkBtn('关闭', () => box.remove()));
+        box.appendChild(pre);
+        box.appendChild(bar);
+        (ov || document.body || document.documentElement).appendChild(box);
+    }
+
     try {
         GM_registerMenuCommand('打开影片墙', openOverlay);
         GM_registerMenuCommand('影片墙设置', buildSettingsPanel);
@@ -6208,6 +6408,7 @@
             toast('已把当前目录设为影片库根目录 (cid=' + cid + ')', 'success', 3000);
         });
         GM_registerMenuCommand('自检读取链路（NFO/海报）', runReadDiag);
+        GM_registerMenuCommand('诊断：覆盖层铺不满 / 被遮挡', showLayerDiag);
     } catch (e) { /* ignore */ }
 
     // 调试/测试出口（命名空间隔离）
@@ -6274,6 +6475,10 @@
             getCfg: () => CFG, setCfg: (o) => { CFG = Object.assign(CFG, o); },
             saveCfg: saveCfg,
             noCidHint, currentCid,
+            // v3.16.6 覆盖层站位（top layer / 坐标补偿）
+            topLayerState, layerCoversViewport, toTopLayer, fitViewport, clearFit,
+            ensureOverlayTopLayer, startLayerWatch, stopLayerWatch,
+            getLayerInfo: () => ({ mode: layerMode, error: layerError }),
             /**
              * 布局自检：覆盖层「说」要铺满视口，实际铺了多少？被谁挡住？
              * Console 里跑 __mw.diagLayout() —— 打印一张表，不用猜。
@@ -6303,11 +6508,16 @@
                     铺满视口: Math.round(r.width) === win.w && Math.round(r.height) === win.h,
                     position: cs.position, zIndex: cs.zIndex, display: cs.display,
                     topLayer: (() => {
-                        try { return ov.matches(':popover-open') ? '在（popover）' : '不在'; }
-                        catch (e) { return '内核不支持 popover'; }
+                        const s = topLayerState(ov);
+                        if (s === 'open') return '在（popover）';
+                        if (s === 'unsupported') return '不在（内核不支持 popover）';
+                        return '不在';
                     })(),
-                    // fixed 的包含块会被祖先的 transform/filter/perspective/contain 改掉 ——
-                    // 「只盖住文件列表区」就是它干的。这里把元凶直接指出来。
+                    覆盖层站位方式: layerMode + (layerError ? '（' + layerError + '）' : ''),
+                    坐标补偿: layerMode === 'fixed+fit'
+                        ? (ov.style.left + ' ' + ov.style.top + ' / ' + ov.style.width + ' × ' + ov.style.height)
+                        : '(未启用)',
+                    页面上下文: (window.top === window ? '顶层文档' : '在 iframe 内 —— 覆盖层只能盖住 iframe 那块'),
                     可疑祖先: (() => {
                         let p = ov.parentElement;
                         while (p && p !== document.documentElement) {
@@ -6335,7 +6545,7 @@
 
     // 启动横幅的版本号从 @version 读，别写死 —— 这里曾经写死成 3.13.2，
     // 后来连升三个版本它一直没动，排查时看着那一行还以为装的是旧版。
-    let MW_VER = '3.16.5';
+    let MW_VER = '3.16.6';
     try { if (typeof GM_info !== 'undefined' && GM_info.script) MW_VER = GM_info.script.version || MW_VER; }
     catch (e) { /* ignore */ }
     console.log('[115影片墙] v' + MW_VER + ' 已加载（横版卡片默认用「横版高清」＝ -thumb/-fanart 里挑最大的那张；海报太小会自动换清晰图）');

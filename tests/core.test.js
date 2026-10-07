@@ -137,15 +137,15 @@ test('整理助手：改名回滚接线完整', () => {
   assert.ok(/renameJournal = inverse;/.test(src), '回滚后没有写回反向映射');
 });
 
-test('影片墙：覆盖层进 top layer，别被 115 的 transform / 顶栏 z-index 打败（v3.16.5）', () => {
+test('影片墙：覆盖层进 top layer，进不去就按包含块补偿坐标（v3.16.6）', () => {
   const src = readScript('115影片墙.user.js');
 
   // 背景：`position:fixed;inset:0` 挂在 body 上，正常必然铺满视口。
-  // 用户实机反馈「只盖住文件列表区」，两条路都能把它打败：
-  //   ① 115 给 body/html 挂了 transform/filter（GPU 提升的常见写法）
-  //      → fixed 的包含块从「视口」变成那个祖先，覆盖层跟着缩水
-  //   ② 115 顶栏用的是 z-index:2147483647（int32 上限），比覆盖层的 2147483500 还高
-  // 解法：原生 popover 进 top layer —— 包含块恒为视口，优先级高于任何 z-index。
+  // 用户实机反馈「只盖住文件列表区」，而且补了关键一句：**重装后第一次是好的、
+  // 刷新一次就坏** —— 说明这跟页面运行期状态有关，不是 CSS 写错。两条路能打败它：
+  //   ① 祖先挂 transform/filter（GPU 提升、切换动画都会）→ fixed 的包含块从视口变成那个祖先
+  //   ② 115 顶栏用 z-index:2147483647（int32 上限），比覆盖层的 2147483500 高
+  // 首选 popover 进 top layer（两条都免疫）；进不去就退回普通 fixed 并按包含块反算坐标。
   // （两条都实测过，见 tools/make-overlay-smoke.js）
 
   // ① 样式：popover 的 UA 默认样式必须压平，否则会是 fit-content + margin:auto 居中 + 带边框
@@ -158,26 +158,51 @@ test('影片墙：覆盖层进 top layer，别被 115 的 transform / 顶栏 z-i
   // [popover]:not(:popover-open){display:none} → 关掉之后覆盖层不会消失
   assert.ok(/#mw-overlay\[popover\]:not\(:popover-open\)\{[^}]*display:\s*none/.test(src),
     '缺 popover 关闭态的 display:none —— 少了它，关掉影片墙后覆盖层还杵在页面上');
+  // ①b 兜底样式：退回普通 fixed 时 z-index 要顶到上限（同值靠 DOM 顺序取胜）
+  assert.ok(/#mw-overlay\.mw-nolayer\{[^}]*z-index:\s*2147483647/.test(src),
+    '缺 .mw-nolayer 的 z-index 上限 —— 退回普通 fixed 时拼不过 115 顶栏的 2147483647');
 
-  // ② 开关函数
-  assert.ok(/function toTopLayer\(el\)/.test(src), '缺 toTopLayer');
-  assert.ok(/function outTopLayer\(el\)/.test(src), '缺 outTopLayer');
-  const tl = src.slice(src.indexOf('function toTopLayer'));
-  const tlBody = tl.slice(0, tl.indexOf('let mwKeysBound'));
-  assert.ok(/typeof el\.showPopover !== 'function'/.test(tlBody),
+  // ② 进 top layer 的开关
+  const tl = src.slice(src.indexOf('function topLayerState'), src.indexOf('function outTopLayer'));
+  assert.ok(/function toTopLayer\(el\)/.test(tl), '缺 toTopLayer');
+  assert.ok(/typeof el\.showPopover !== 'function'/.test(tl),
     '老内核没有 popover API 时要能退回普通 fixed，不能直接抛错');
-  assert.ok(/setAttribute\('popover',\s*'manual'\)/.test(tlBody),
+  assert.ok(/setAttribute\('popover',\s*'manual'\)/.test(tl),
     '必须先设 popover 属性再 showPopover —— 没有该属性时 showPopover 抛 NotSupportedError');
-  assert.ok(/matches\(':popover-open'\)/.test(tlBody),
-    '已在 top layer 时再 showPopover 抛 InvalidStateError，调用前要先判断');
+  // 同一个 try 里放「查 :popover-open」和「showPopover」，选择器一旦不被认识就整段跳过、
+  // showPopover 根本不会被调用 —— 必须拆开
+  assert.ok(/if \(!already\) \{\s*\/\/[^\n]*\n\s*try \{ el\.showPopover\(\); \}/.test(tl) ||
+    /if \(!already\) \{\s*\n\s*try \{ el\.showPopover\(\); \}/.test(tl),
+    'showPopover 必须单独 try —— 跟 :popover-open 挤在一起，选择器不认识就会静默跳过它');
+  assert.ok(/return \{ ok: open, error:/.test(tl),
+    'toTopLayer 要把失败原因带出来，不能只返回布尔（自检面板要靠它说清为什么）');
+  assert.ok(/function outTopLayer\(el\)/.test(src), '缺 outTopLayer');
 
-  // ③ 覆盖层建好后要真的送进去
-  assert.ok(/document\.body\.appendChild\(ov\);\s*\n\s*toTopLayer\(ov\);/.test(src),
-    'buildOverlay 没有把覆盖层送进 top layer');
-  // ④ 关窗要收起（remove() 本身会自动弹出 top layer，这里显式再收一次做双保险）
+  // ③ 判定标准：量真实矩形，不信 API 的自我报告
+  const covers = src.slice(src.indexOf('function layerCoversViewport'), src.indexOf('function toTopLayer'));
+  assert.ok(/getBoundingClientRect\(\)/.test(covers), 'layerCoversViewport 必须真的量一遍');
+  assert.ok(/r\.width >= v\.w - 2/.test(covers), 'layerCoversViewport 没跟视口尺寸比');
+
+  // ④ 兜底：拿 1px 探针量出包含块的坐标系，再把坐标反算回去
+  const fit = src.slice(src.indexOf('function fitViewport'), src.indexOf('function clearFit'));
+  assert.ok(/st\.width = '1px'/.test(fit), 'fitViewport 得先用 1px 探针量坐标系');
+  assert.ok(/st\.left = \(-r\.left \/ sx\)/.test(fit), 'fitViewport 没把坐标反算回去');
+  assert.ok(/st\.width = \(v\.w \/ sx\)/.test(fit), 'fitViewport 没按缩放比还原宽度');
+  assert.ok(/function clearFit\(el\)/.test(src), '缺 clearFit（进了 top layer 要把补偿清掉）');
+
+  // ⑤ 挂载点：建好后送去站对位置，并开启看门人
+  assert.ok(/document\.body\.appendChild\(ov\);\s*\n\s*ensureOverlayTopLayer\(ov\);/.test(src),
+    'buildOverlay 没有把覆盖层送去站对位置');
+  assert.ok(/ensureOverlayTopLayer\(ov\);[\s\S]{0,80}startLayerWatch\(\);/.test(src),
+    '缺 startLayerWatch —— 115 有可能在我们之后才给容器加 transform，得盯着');
+  assert.ok(/stopLayerWatch\(\);/.test(src), 'closeOverlay 没停看门人（关窗后还在空跑）');
+  // ⑥ 关窗要收起（remove() 本身会自动弹出 top layer，这里显式再收一次做双保险）
   assert.ok(/outTopLayer\(ov\); ov\.remove\(\);/.test(src), 'closeOverlay 没有收起 top layer');
+  // ⑦ 诊断入口走菜单 —— 不是每个人都会开 F12，出问题时截图比跑命令行现实
+  assert.ok(/GM_registerMenuCommand\('诊断：覆盖层铺不满/.test(src),
+    '缺「诊断：覆盖层铺不满」菜单项');
 
-  // ⑤ 从属浮层必须挂进覆盖层内部。
+  // ⑧ 从属浮层必须挂进覆盖层内部。
   //    覆盖层进了 top layer 后，还挂在 body 上的设置面板/详情面板会被它整个盖住 ——
   //    点都点不到（top layer 高于页面上任何 z-index，堆多少 z-index 都没用）。
   assert.ok(/function layerHost\(\)/.test(src), '缺 layerHost（从属浮层的统一挂载点）');

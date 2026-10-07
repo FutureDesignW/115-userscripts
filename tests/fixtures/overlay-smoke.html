@@ -15,17 +15,21 @@
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
       display:flex;flex-direction:column;}
     /* ⚠️ 光靠 position:fixed + 大 z-index 靠不住（用户实机反馈「只盖住文件列表区」）：
-         ① 115 只要给 body/html 挂上 transform/filter（GPU 提升的常见写法），
+         ① 115 只要给 body/某个容器挂上 transform/filter（GPU 提升、切换动画都会用），
             fixed 的包含块就从「视口」变成那个祖先 —— 覆盖层跟着缩水；
          ② 115 顶栏用的是 z-index:2147483647（int32 上限），比这里的 2147483500 还高，
             覆盖层会被顶栏和侧栏盖住。
-       解法是把覆盖层送进 **top layer**（原生 popover）：里面包含块恒为视口，
+       首选解法是把覆盖层送进 **top layer**（原生 popover）：里面包含块恒为视口，
        且优先级高于任何 z-index。下面这几行是把 UA 给 popover 的默认样式压平
        （否则会是 fit-content 宽高 + margin:auto 居中 + 边框内边距）。 */
     #mw-overlay[popover]{width:auto;height:auto;max-width:none;max-height:none;margin:0;padding:0;border:0;overflow:visible;}
     /* 自己那条 display:flex 会盖掉 UA 的 [popover]:not(:popover-open){display:none}，
        必须显式补回来，否则关掉之后元素还在页面上杵着。 */
     #mw-overlay[popover]:not(:popover-open){display:none;}
+    /* 进不去 top layer 时的兜底：退回普通 fixed，坐标由 fitViewport() 按包含块反算
+       （内联 left/top/宽高，见脚本里的 fitViewport）。z-index 顶到 int32 上限，
+       跟 115 顶栏同值 —— 同值看 DOM 顺序，我们的元素是 body 的最后一个子节点，还是我们赢。 */
+    #mw-overlay.mw-nolayer{z-index:2147483647;}
 
   /* 覆盖层内部的从属浮层（详情面板那种），随手摆一个够大的占位 */
   #mw-detail-ov { position: fixed; inset: 0; z-index: 2147483610; background: rgba(0,0,0,.6); }
@@ -47,14 +51,120 @@
   var out = {};
   var ov = document.getElementById('mw-overlay');
 
+  // —— 从脚本里原样抠出来的兜底逻辑 ——
+  let layerMode = '-';
+let layerError = '';
+function topLayerState(el) {
+        if (!el) return 'closed';
+        if (typeof el.showPopover !== 'function') return 'unsupported';
+        try { return el.matches(':popover-open') ? 'open' : 'closed'; }
+        catch (e) { return 'unsupported'; }        // 选择器都不认识，就当这内核没这套
+    }
+
+function vpSize() {
+        const de = document.documentElement || {};
+        return {
+            w: Math.max(innerWidth || 0, de.clientWidth || 0),
+            h: Math.max(innerHeight || 0, de.clientHeight || 0)
+        };
+    }
+
+function layerCoversViewport(el) {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const v = vpSize();
+        return r.width >= v.w - 2 && r.height >= v.h - 2 && r.left <= 1 && r.top <= 1;
+    }
+
+function toTopLayer(el) {
+        if (!el) return { ok: false, error: '元素不存在' };
+        if (typeof el.showPopover !== 'function') return { ok: false, error: '内核不支持 popover（没有 showPopover）' };
+        try {
+            // manual：不参与 light dismiss，开合完全由我们自己的按钮/Escape 说了算
+            if (!el.hasAttribute('popover')) el.setAttribute('popover', 'manual');
+        } catch (e) {
+            return { ok: false, error: '设置 popover 属性失败：' + (e && e.message) };
+        }
+        // :popover-open 单独 try —— 万一选择器不被认识，也不能连累 showPopover 不被调用
+        let already = false;
+        try { already = !!el.matches(':popover-open'); } catch (e) { /* 选择器不支持 */ }
+        if (!already) {
+            try { el.showPopover(); }
+            catch (e) { return { ok: false, error: 'showPopover 抛错：' + (e && e.message) }; }
+        }
+        let open = true;
+        try { open = !!el.matches(':popover-open'); } catch (e) { /* 选择器不支持就默认相信 */ }
+        return { ok: open, error: open ? '' : 'showPopover 调了但没进 top layer' };
+    }
+
+function outTopLayer(el) {
+        try {
+            if (el && typeof el.matches === 'function' && el.matches(':popover-open')) el.hidePopover();
+        } catch (e) { /* ignore */ }
+    }
+
+function fitViewport(el) {
+        if (!el) return;
+        const st = el.style;
+        st.left = '0px'; st.top = '0px'; st.right = 'auto'; st.bottom = 'auto';
+        st.margin = '0'; st.width = '1px'; st.height = '1px';
+        const r = el.getBoundingClientRect();       // 会强制一次布局，量到的才是真实结果
+        const sx = r.width || 1, sy = r.height || 1; // 本地 1px 在视口里是多少 px
+        const v = vpSize();
+        st.left = (-r.left / sx) + 'px';
+        st.top = (-r.top / sy) + 'px';
+        st.width = (v.w / sx) + 'px';
+        st.height = (v.h / sy) + 'px';
+    }
+
+function clearFit(el) {
+        if (!el || !el.style) return;
+        ['left', 'top', 'right', 'bottom', 'width', 'height', 'margin']
+            .forEach((k) => el.style.removeProperty(k));
+    }
+
+function ensureOverlayTopLayer(ov) {
+        if (!ov) return;
+        // 已经定下走兜底的，就别再反复折腾 popover 了 ——
+        // 「设属性 → showPopover 失败 → 摘属性」来回折腾会让覆盖层闪一下（属性在、又没 open
+        // 的时候命中 :not(:popover-open){display:none}）。兜底模式只需重算坐标。
+        if (ov.__mwFitMode) { fitViewport(ov); return; }
+
+        const res = toTopLayer(ov);
+        if (res.ok && layerCoversViewport(ov)) {
+            clearFit(ov);
+            ov.classList.remove('mw-nolayer');
+            layerMode = 'top-layer'; layerError = '';
+            return;
+        }
+        // 退回普通 fixed。⚠️ 必须把 popover 属性摘掉：留着它而元素又不是 open 状态，
+        // 自己那条 [popover]:not(:popover-open){display:none} 会把覆盖层整个藏起来
+        // （showPopover 抛错时就会落到这里，属性已经设上了）。
+        try { ov.removeAttribute('popover'); } catch (e) { /* ignore */ }
+        ov.__mwFitMode = true;
+        ov.classList.add('mw-nolayer');
+        clearFit(ov);                 // 先清干净再量，免得量到上一轮的补偿值
+        fitViewport(ov);
+        layerMode = 'fixed+fit';
+        layerError = res.error || '在 top layer 里但没铺满视口';
+        if (!res.ok) {
+            console.warn('[115影片墙] 覆盖层没能进 top layer（' + res.error + '）—— 已改用坐标补偿兜底。' +
+                '如果画面还是不对，油猴菜单里点「诊断：覆盖层铺不满」把结果发我');
+        }
+        if (!layerCoversViewport(ov)) layerError += ' ｜ 坐标补偿后仍未铺满（可能在别的文档上下文里）';
+    }
+
+var layerInfo = function () { return layerMode + (layerError ? '（' + layerError + '）' : ''); };
+
   // 1×1 之外还要留 20px 容差：有滚动条时 fixed/popover 的 inset:0 不含滚动条宽度
-  var covers = function () {
-    var r = ov.getBoundingClientRect();
+  var covers = function (el) {
+    var r = (el || ov).getBoundingClientRect();
     return r.width >= window.innerWidth - 20 && r.height >= window.innerHeight - 20;
   };
-  var size = function () {
-    var r = ov.getBoundingClientRect();
-    return Math.round(r.width) + '×' + Math.round(r.height);
+  var size = function (el) {
+    var r = (el || ov).getBoundingClientRect();
+    return Math.round(r.width) + '×' + Math.round(r.height) +
+           ' @ ' + Math.round(r.left) + ',' + Math.round(r.top);
   };
   // 顶栏正中间那点，返回最上层元素 —— 用来判「有没有被顶栏盖住」
   var topAt = function () {
@@ -70,7 +180,7 @@
 
     // —— 走真实脚本那条路：setAttribute('popover','manual') + showPopover() ——
     if (typeof ov.showPopover !== 'function') {
-      out['错误'] = '这个内核没有 popover API，脚本会退回普通 fixed（这部分测不了）';
+      out['错误'] = '这个内核没有 popover API，脚本会退回普通 fixed（兜底路径见 ⑦）';
       throw new Error('no popover');
     }
     ov.setAttribute('popover', 'manual');
@@ -98,8 +208,50 @@
     ov.hidePopover();
     out['⑥ 关掉后不占位'] = ov.getBoundingClientRect().width === 0;
     out['⑥ 关掉后 display'] = getComputedStyle(ov).display;
+    document.body.style.transform = '';
+
+    // ================= ⑦ 兜底路径：内核没有 popover =================
+    // 用户报的就是这条：重新装完第一次好、刷新一次就坏 —— 大概率是 popover 没进去，
+    // 退回普通 fixed 后又被祖先的 transform 改了包含块。
+    ov.removeAttribute('popover');                    // 老内核上根本不会有这个属性
+    ov.showPopover = undefined;                       // 盖掉原型上的方法，模拟没有该 API
+    document.body.style.transform = 'translate(40px, 30px) scale(0.8)';
+    void ov.offsetHeight;
+    out['⑦ 兜底前尺寸（缩水 = 用户看到的）'] = size();
+    out['⑦ 兜底前铺满'] = covers();
+
+    ensureOverlayTopLayer(ov);                        // 就是脚本建好覆盖层时走的那一条
+    void ov.offsetHeight;
+    out['⑦ 兜底后尺寸'] = size();
+    out['⑦ 兜底后铺满'] = covers();
+    out['⑦ 站位方式'] = layerInfo();
+    // popover 属性必须摘掉 —— 留着它而元素又不是 open，会被 :not(:popover-open){display:none} 藏起来
+    out['⑦ popover 属性已摘'] = !ov.hasAttribute('popover');
+
+    // 看门人会反复调它，不能越算越偏
+    ensureOverlayTopLayer(ov); ensureOverlayTopLayer(ov); ensureOverlayTopLayer(ov);
+    void ov.offsetHeight;
+    out['⑦ 反复调用不发散'] = covers();
+    out['⑦ 反复调用后尺寸'] = size();
+
+    // ================= ⑧ showPopover 抛错：属性设上了、元素却没打开 =================
+    // 这是写兜底时真踩到的坑：popover 属性留着而元素不是 open，会命中
+    // #mw-overlay[popover]:not(:popover-open){display:none} —— 覆盖层直接隐身，
+    // 用户会以为「脚本坏了」。所以走兜底时**必须把 popover 属性摘掉**。
+    var ov2 = document.createElement('div');
+    ov2.id = 'mw-overlay';                       // 借同一套样式
+    ov2.showPopover = function () { throw new Error('boom'); };
+    document.body.appendChild(ov2);
+    out['⑧ 抛错前 display'] = getComputedStyle(ov2).display;   // 还没设属性，是 flex
+    ensureOverlayTopLayer(ov2);
+    void ov2.offsetHeight;
+    out['⑧ 兜底后不隐身'] = getComputedStyle(ov2).display !== 'none';
+    out['⑧ 兜底后铺满'] = covers(ov2);
+    out['⑧ 抛错原因带出来了'] = /boom/.test(layerInfo());
+    ov2.remove();
 
     document.body.style.transform = '';
+    clearFit(ov);
   } catch (e) {
     if (!out['错误']) out['错误'] = e.message;
   }
@@ -112,7 +264,14 @@
     '④ 覆盖层盖住了顶栏': true,
     '⑤ 内部浮层也在顶栏之上': true,
     '⑥ 关掉后不占位': true,
-    '⑥ 关掉后 display': 'none'
+    '⑥ 关掉后 display': 'none',
+    '⑦ 兜底前铺满': false,
+    '⑦ 兜底后铺满': true,
+    '⑦ popover 属性已摘': true,
+    '⑦ 反复调用不发散': true,
+    '⑧ 兜底后不隐身': true,
+    '⑧ 兜底后铺满': true,
+    '⑧ 抛错原因带出来了': true
   };
   // 分母只算「有期望值」的项 —— 纯展示项（视口、尺寸）不该稀释成功率
   var pass = 0, total = 0;
